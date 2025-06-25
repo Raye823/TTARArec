@@ -125,6 +125,7 @@ class TTARArec(SequentialRecommender):
         self.item_seq_all = None
         self.item_seq_len_all = None
         self.seq_emb_knowledge = None
+        self.item_seq_knowledge = None  # 新增：原始交互序列知识库
         self.tar_emb_knowledge = None
         self.seq_emb_index = None
         self.tar_emb_index = None
@@ -166,7 +167,7 @@ class TTARArec(SequentialRecommender):
     def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
         """使用检索增强进行序列增强"""
         # 检索相似序列和目标嵌入
-        retrieved_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
+        retrieved_seqs1, retrieved_item_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_item_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
             seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
         )
 
@@ -186,7 +187,7 @@ class TTARArec(SequentialRecommender):
         return seq_output
 
     def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
-        """检索相似序列和对应的目标嵌入"""
+        """检索相似序列和对应的目标嵌入以及原始交互序列"""
         queries_cpu = queries.detach().cpu().numpy()
         normalize_L2(queries_cpu)
         _, I1 = self.seq_emb_index.search(queries_cpu, 4*topk)
@@ -205,16 +206,21 @@ class TTARArec(SequentialRecommender):
         
         I1_filtered = np.array(I1_filtered)
         
-        # 获取检索结果
-        retrieval_seq1 = self.seq_emb_knowledge[I1_filtered]
-        retrieval_tar1 = self.tar_emb_knowledge[I1_filtered]
+        # 获取检索结果 - 三项内容：序列表征、原始交互序列、目标嵌入
+        retrieval_seq1 = self.seq_emb_knowledge[I1_filtered]  # 序列表征
+        retrieval_item_seq1 = self.item_seq_knowledge[I1_filtered]  # 原始交互序列
+        retrieval_tar1 = self.tar_emb_knowledge[I1_filtered]  # 目标嵌入
+        
         retrieval_seq2 = self.seq_emb_knowledge[I1_filtered]
+        retrieval_item_seq2 = self.item_seq_knowledge[I1_filtered]
         retrieval_tar2 = self.tar_emb_knowledge[I1_filtered]
         
         return (
             torch.tensor(retrieval_seq1).to("cuda"), 
+            torch.tensor(retrieval_item_seq1).to("cuda"),  # 新增返回原始交互序列
             torch.tensor(retrieval_tar1).to("cuda"), 
             torch.tensor(retrieval_seq2).to("cuda"), 
+            torch.tensor(retrieval_item_seq2).to("cuda"),  # 新增返回原始交互序列
             torch.tensor(retrieval_tar2).to("cuda")
         )
 
@@ -230,7 +236,7 @@ class TTARArec(SequentialRecommender):
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
         
         # 检索相似序列和目标嵌入
-        retrieved_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
+        retrieved_seqs1, retrieved_item_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_item_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
             seq_output,
             batch_user_id, 
             batch_seq_len,
@@ -361,7 +367,7 @@ class TTARArec(SequentialRecommender):
     def precached_knowledge(self):
         """预缓存知识库 - 构建检索索引"""
         print("开始构建检索知识库...")
-        seq_emb_knowledge, tar_emb_knowledge, user_id_list = None, None, None
+        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, user_id_list = None, None, None, None
         item_seq_all = None
         item_seq_len_all = None
         
@@ -402,11 +408,17 @@ class TTARArec(SequentialRecommender):
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID][look_up_indices].detach().cpu().numpy())
             
-            # 累积知识
+            # 累积知识 - 三项内容：序列表征、原始交互序列、目标嵌入
             if isinstance(seq_emb_knowledge, np.ndarray):
                 seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             else:
                 seq_emb_knowledge = seq_output.detach().cpu().numpy()
+            
+            # 新增：累积原始交互序列
+            if isinstance(item_seq_knowledge, np.ndarray):
+                item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
+            else:
+                item_seq_knowledge = item_seq.detach().cpu().numpy()
             
             if isinstance(tar_emb_knowledge, np.ndarray):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
@@ -418,23 +430,23 @@ class TTARArec(SequentialRecommender):
             else:
                 user_id_list = user_id_cans
         
-        # 保存知识库
+        # 保存知识库 - 三项内容
         self.user_id_list = user_id_list
         self.item_seq_all = item_seq_all
         self.item_seq_len_all = item_seq_len_all
-        self.seq_emb_knowledge = seq_emb_knowledge
-        self.tar_emb_knowledge = tar_emb_knowledge
+        self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
+        self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列
+        self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
         
         # 构建Faiss索引
         self._build_faiss_index()
         print(f"知识库构建完成，包含 {len(user_id_list)} 个序列样本")
-
-
+        print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
 
     def precached_knowledge_val(self, val_dataset):
         """为验证集构建知识库"""
         print("为验证集构建检索知识库...")
-        seq_emb_knowledge, tar_emb_knowledge, user_id_list = None, None, None
+        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, user_id_list = None, None, None, None
         item_seq_len_all = None
         
         # 处理训练集
@@ -469,11 +481,17 @@ class TTARArec(SequentialRecommender):
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID][look_up_indices].detach().cpu().numpy())
             
-            # 累积知识
+            # 累积知识 - 三项内容：序列表征、原始交互序列、目标嵌入
             if isinstance(seq_emb_knowledge, np.ndarray):
                 seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             else:
                 seq_emb_knowledge = seq_output.detach().cpu().numpy()
+                
+            # 新增：累积原始交互序列
+            if isinstance(item_seq_knowledge, np.ndarray):
+                item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
+            else:
+                item_seq_knowledge = item_seq.detach().cpu().numpy()
                 
             if isinstance(tar_emb_knowledge, np.ndarray):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
@@ -502,10 +520,17 @@ class TTARArec(SequentialRecommender):
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID].detach().cpu().numpy())
             
+            # 累积知识 - 三项内容
             if isinstance(seq_emb_knowledge, np.ndarray):
                 seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             else:
                 seq_emb_knowledge = seq_output.detach().cpu().numpy()
+                
+            # 新增：累积原始交互序列
+            if isinstance(item_seq_knowledge, np.ndarray):
+                item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
+            else:
+                item_seq_knowledge = item_seq.detach().cpu().numpy()
                 
             if isinstance(tar_emb_knowledge, np.ndarray):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
@@ -517,15 +542,17 @@ class TTARArec(SequentialRecommender):
             else:
                 user_id_list = user_id_cans
                 
-        # 保存知识库
+        # 保存知识库 - 三项内容
         self.user_id_list = user_id_list
         self.item_seq_len_all = item_seq_len_all
-        self.seq_emb_knowledge = seq_emb_knowledge
-        self.tar_emb_knowledge = tar_emb_knowledge
+        self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
+        self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列  
+        self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
         
         # 构建Faiss索引
         self._build_faiss_index()
         print(f"验证集知识库构建完成，包含 {len(user_id_list)} 个序列样本")
+        print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
 
     def _build_faiss_index(self):
         """构建Faiss检索索引"""
