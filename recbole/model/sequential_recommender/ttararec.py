@@ -171,8 +171,6 @@ class TTARArec(SequentialRecommender):
             seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
         )
 
-        # 使用检索器编码器调整原始序列表示
-        retriever_encoded_seq = self.retriever_forward(seq_output)
         
         # 计算检索器编码后序列与相似序列的相似度作为权重
         similarities = torch.sum(retriever_encoded_seq.unsqueeze(1) * retrieved_seqs1, dim=-1)  # [B, K]
@@ -243,9 +241,9 @@ class TTARArec(SequentialRecommender):
             topk=self.topk
         )
         
-        # 计算检索分布：基于检索器编码后序列与目标项的融合相似度
+        # 计算检索分布：基于原始序列拼接和重新编码的相似度
         retrieval_probs = self.compute_retrieval_scores(
-            seq_output, retrieved_seqs1, retrieved_tars1, pos_items
+            retrieved_item_seqs1, retrieved_tars1, pos_items, item_seq, item_seq_len
         )  # [B, K]
         
         # 计算推荐分布：基于原序列与检索序列的点积相似度
@@ -261,27 +259,71 @@ class TTARArec(SequentialRecommender):
         
         return total_loss
 
-    def compute_retrieval_scores(self, seq_output, retrieved_seqs, retrieved_tars, pos_items):
-        """计算检索评分 - 基于检索器编码后序列与目标嵌入的融合相似度"""
-        batch_size, n_retrieved, hidden_size = retrieved_seqs.size()
+    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len):
+        """计算检索评分 - 基于原始序列拼接和重新编码的相似度"""
+        batch_size, n_retrieved, _ = retrieved_tars.size()
         pos_items_emb = self.get_item_embedding(pos_items)  # [batch_size, hidden_size]
         
-        # 使用检索器编码器处理原始序列
-        retriever_encoded_seq = self.retriever_forward(seq_output)
-        
-        # 计算融合目标嵌入后的表示与目标项的相似度
         fusion_scores = []
         
-        # 对每个检索到的目标嵌入进行融合并计算相似度
+        # 对每个检索到的原始序列进行处理
         for i in range(n_retrieved):
-            # 获取当前检索结果的目标嵌入
-            current_tar_emb = retrieved_tars[:, i, :]  # [batch_size, hidden_size]
+            batch_new_seqs = []
+            batch_new_seq_lens = []
             
-            # 加权融合：检索器编码后序列 + 检索目标嵌入
-            fused_rep = self.alpha * retriever_encoded_seq + (1 - self.alpha) * current_tar_emb
+            # 为batch中每个样本处理
+            for batch_idx in range(batch_size):
+                # 获取当前输入的原始序列和长度
+                current_item_seq = item_seq[batch_idx]  # [max_seq_len]
+                current_seq_len = item_seq_len[batch_idx].item()  # 标量
+                
+                # 获取检索到的原始序列
+                retrieved_item_seq = retrieved_item_seqs[batch_idx, i, :]  # [max_seq_len]
+                
+                # 找到检索序列的有效长度（去掉padding的0）
+                retrieved_seq_len = 0
+                for j in range(retrieved_item_seq.size(0)):
+                    if retrieved_item_seq[j].item() != 0:
+                        retrieved_seq_len += 1
+                    else:
+                        break
+                
+                # 拼接序列：当前序列的有效部分 + 检索到的序列的有效部分
+                current_valid_seq = current_item_seq[:current_seq_len]
+                retrieved_valid_seq = retrieved_item_seq[:retrieved_seq_len]
+                
+                # 拼接后的新序列
+                new_seq = torch.cat([current_valid_seq, retrieved_valid_seq])
+                new_seq_len = current_seq_len + retrieved_seq_len
+                
+                # 使用固定的最大长度，如果超出则截断保留最近的交互
+                max_seq_len = item_seq.size(1)
+                if new_seq_len > max_seq_len:
+                    new_seq = new_seq[-max_seq_len:]  # 保留最近的交互
+                    new_seq_len = max_seq_len
+                
+                # 填充到固定长度
+                padded_new_seq = torch.zeros(max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
+                padded_new_seq[:new_seq_len] = new_seq
+                
+                batch_new_seqs.append(padded_new_seq)
+                batch_new_seq_lens.append(new_seq_len)
             
-            # 计算融合后表示与目标项的点积相似度
-            similarity_score = torch.sum(fused_rep * pos_items_emb, dim=-1)  # [batch_size]
+            # 将batch中的新序列堆叠
+            batch_new_seqs = torch.stack(batch_new_seqs, dim=0)  # [batch_size, max_seq_len]
+            batch_new_seq_lens = torch.tensor(batch_new_seq_lens, device=item_seq.device)  # [batch_size]
+            
+            # 使用DuoRec编码器重新编码新序列
+            new_seq_output = self.forward(batch_new_seqs, batch_new_seq_lens)  # [batch_size, hidden_size]
+            
+            # 从DuoRec输出中分离梯度，然后重新启用梯度用于检索器MLP训练
+            new_seq_output = new_seq_output.detach().requires_grad_(True)
+            
+            # 使用检索器MLP进一步处理序列表征
+            enhanced_seq_output = self.retriever_forward(new_seq_output)  # [batch_size, hidden_size]
+            
+            # 计算增强后序列表征与真实下一项的相似度
+            similarity_score = torch.sum(enhanced_seq_output * pos_items_emb, dim=-1)  # [batch_size]
             fusion_scores.append(similarity_score)
         
         # 将所有检索结果的相似度堆叠
