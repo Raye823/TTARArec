@@ -1,0 +1,249 @@
+# 推荐系统科研项目 - RaSeRec简化版本 Cursor开发规范
+# ==============================================
+
+## 项目概述
+本项目基于预训练的DuoRec模型，通过检索增强技术提升推荐性能。核心训练策略是通过KL散度优化检索器编码器，使检索器评分分布接近预训练推荐器的Transformer注意力权重分布。融合机制采用简单的点积相似度，重点在于训练检索器的查询变换能力。
+
+## 核心训练逻辑
+
+### 1. **预训练模型加载**
+- 加载预训练的DuoRec模型（基于Transformer自注意力的序列推荐器）
+- 冻结预训练模型参数，仅训练检索器编码器
+- 构建知识库：缓存训练数据的序列表示和目标项嵌入
+
+### 2. **两个评分分布的定义**
+
+#### 🎯 **检索器评分分布 P_R(d|x)**
+```python
+def compute_retrieval_scores(self, seq_output, retrieved_seqs, retrieved_tars, pos_items):
+```
+
+#### 🎯 **推荐器评分分布 Q_M(d|x,y)**
+```python
+def compute_recommendation_scores(self, seq_output, retrieved_seqs, retrieved_tars):
+```
+
+### 3. **KL散度训练目标**
+```python
+def calculate_loss(self, interaction):
+    """
+    L = (1/|B|) * sum_x KL(P_R(d|x) || Q_M(d|x,y))
+    优化检索器分布使其接近推荐器的注意力分布
+    """
+    retrieval_probs = self.compute_retrieval_scores(...)    # 检索器分布
+    recommendation_probs = self.compute_recommendation_scores(...)  # 预训练注意力分布
+    
+    kl_loss = torch.sum(retrieval_probs * torch.log(retrieval_probs / recommendation_probs), dim=-1)
+    return kl_loss.mean()
+```
+
+## 技术栈和框架
+- **主框架**: RecBole (推荐系统开源框架)
+- **预训练模型**: DuoRec (基于Transformer的序列推荐器)
+- **深度学习**: PyTorch 2.4.1+
+- **检索技术**: FAISS, 自定义检索器编码器(MLP)
+- **融合机制**: 点积相似度 + 加权平均（替代复杂注意力）
+- **注意力提取**: Transformer MultiHeadAttention权重
+- **数据处理**: pandas, numpy, scikit-learn
+
+## 模型架构重点
+
+### 1. **完整训练流程**
+```
+1. 加载预训练DuoRec模型 → 冻结所有参数
+2. 构建知识库 → 缓存序列表示和目标项
+3. 训练检索器编码器：
+   ├── 检索器查询变换: MLP(seq_output) 
+   ├── FAISS检索: 获取top-k相似序列
+   ├── 计算检索器分布: 融合→预测→softmax
+   ├── 计算推荐器分布: Transformer注意力权重
+   └── KL散度损失: 优化检索器接近推荐器
+```
+
+### 2. **关键设计原则**
+- **只训练检索器**: 预训练模型参数完全冻结
+- **注意力权重提取**: 使用预训练Transformer的Query/Key变换
+- **简化融合**: 点积相似度替代复杂交叉注意力
+- **分布对齐**: KL散度确保检索器学习预训练模型的偏好
+
+### 3. **参数冻结策略**
+```python
+def _freeze_parameters(self):
+    # 冻结所有参数
+    for param in self.parameters():
+        param.requires_grad = False
+    
+    # 只解冻检索器编码器
+    for param in self.retriever_mlp.parameters():
+        param.requires_grad = True
+    for param in self.retriever_layer_norms.parameters():
+        param.requires_grad = True
+```
+
+## 核心算法实现规范
+
+### 1. **检索器编码器前向传播**
+```python
+def retriever_forward(self, seq_output):
+    """MLP对序列表示进行非线性变换，学习更好的检索查询"""
+    hidden = seq_output
+    for layer, layer_norm in zip(self.retriever_mlp, self.retriever_layer_norms):
+        residual = hidden
+        hidden = layer(hidden)
+        hidden = self.retriever_act_fn(hidden)
+        hidden = self.retriever_dropout_layer(hidden)
+        hidden = layer_norm(hidden + residual)  # 残差连接
+    return hidden
+```
+
+### 2. **注意力权重提取的核心逻辑**
+```python
+# 关键：使用预训练模型的Query/Key变换矩阵
+query = first_attention_layer.query(seq_output.unsqueeze(1))
+key = first_attention_layer.key(retrieved_seq.unsqueeze(1))
+
+# 计算多头注意力分数
+attention_scores = torch.matmul(query, key.transpose(-1, -2))
+attention_scores = attention_scores / sqrt(attention_head_size)
+
+# 平均多头得到最终权重
+attention_weight = attention_scores.mean(dim=2)
+```
+
+### 3. **数值稳定性保证**
+```python
+# KL散度计算
+epsilon = 1e-8
+retrieval_probs = retrieval_probs + epsilon
+recommendation_probs = recommendation_probs + epsilon
+kl_div = torch.sum(retrieval_probs * torch.log(retrieval_probs / recommendation_probs), dim=-1)
+
+# 温度缩放
+logits = scores / self.temperature
+probs = torch.softmax(logits, dim=1)
+```
+
+## 配置文件规范
+
+### 1. **核心参数设置**
+```yaml
+# 预训练模型路径（必需）
+pretrained_path: "./log/RaSeRec/Amazon_Beauty/bs1024-.../model.pth"
+
+# 模型基础参数
+model: RaSeRec
+hidden_size: 64          # 与预训练模型保持一致
+n_layers: 2              # Transformer层数
+n_heads: 2               # 注意力头数
+
+# 检索参数
+top_k: 10                # 检索序列数量
+alpha: 0.5               # 融合权重(原序列:检索序列 = 0.5:0.5)
+nprobe: 1                # FAISS探测参数
+
+# 检索器编码器参数
+retriever_layers: 1         # MLP层数
+retriever_temperature: 0.1  # 检索分布温度
+recommendation_temperature: 0.1  # 推荐分布温度
+retriever_dropout: 0.1      # Dropout率
+kl_weight: 1               # KL损失权重
+```
+
+### 2. **训练参数优化**
+```yaml
+# 训练设置
+epochs: 10
+learning_rate: 0.001     # 检索器学习率
+train_batch_size: 1024
+eval_step: 1
+stopping_step: 5
+
+# 由于只训练检索器，可以使用更大的学习率
+# weight_decay: 0  # 检索器参数量少，不需要强正则化
+```
+
+## 实验设置规范
+
+### 1. **关键消融实验**
+- **检索器层数**: 1层 vs 2层 vs 3层 MLP
+- **温度参数**: retriever_temperature和recommendation_temperature的敏感性
+- **融合权重alpha**: 0.1, 0.3, 0.5, 0.7, 0.9
+- **检索数量top_k**: 5, 10, 20, 50
+- **注意力层选择**: 第1层 vs 最后1层 vs 多层平均
+
+### 2. **重要基线对比**
+- **无检索增强**: 纯预训练DuoRec
+- **随机检索**: 随机选择检索序列
+- **简单相似度**: 不使用注意力权重的版本
+- **完整RaSeRec**: 使用交叉注意力的原始版本
+
+### 3. **评估重点**
+- **推荐性能**: Recall@K, NDCG@K
+- **分布对齐**: KL散度收敛情况
+- **检索质量**: 检索器找到的序列与预训练模型偏好的一致性
+- **训练效率**: 只训练检索器的速度优势
+
+## 调试和验证指南
+
+### 1. **分布对齐检查**
+```python
+# 监控KL散度收敛
+print(f"KL divergence: {kl_loss.item():.4f}")
+
+# 检查两个分布的相似性
+cosine_sim = F.cosine_similarity(retrieval_probs, recommendation_probs, dim=1)
+print(f"Distribution similarity: {cosine_sim.mean():.4f}")
+
+# 验证注意力权重提取
+print(f"Attention weights range: [{recommendation_probs.min():.4f}, {recommendation_probs.max():.4f}]")
+print(f"Attention weights sum: {recommendation_probs.sum(dim=1)}")  # 应该接近1
+```
+
+### 2. **梯度流检查**
+```python
+# 确保只有检索器有梯度
+for name, param in self.named_parameters():
+    if param.grad is not None:
+        print(f"{name}: grad_norm = {param.grad.norm():.6f}")
+    else:
+        print(f"{name}: NO GRADIENT (expected for frozen params)")
+```
+
+### 3. **预训练模型加载验证**
+```python
+# 验证预训练参数加载
+print(f"成功加载预训练模型参数!")
+print(f"缺失的参数键: {missing_keys}")
+print(f"多余的参数键: {unexpected_keys}")
+
+# 检查模型架构匹配
+assert hasattr(self.trm_encoder.layer[0], 'multi_head_attention')
+print("Transformer注意力层加载成功!")
+```
+
+## 核心贡献和创新点
+
+### 1. **理论贡献**
+- **分布对齐学习**: 通过KL散度让检索器学习预训练模型的注意力偏好
+- **查询变换优化**: 专门训练检索器的查询编码能力
+- **简化高效融合**: 点积替代复杂注意力，保持性能降低复杂度
+
+### 2. **技术创新**
+- **注意力权重提取**: 直接利用预训练Transformer的Query/Key变换
+- **参数高效训练**: 只训练检索器，大幅减少训练成本
+- **知识蒸馏思想**: 将预训练模型的注意力知识蒸馏到检索器
+
+### 3. **实验验证要点**
+- 证明检索器分布确实学会了预训练模型的偏好
+- 验证简化融合机制不会显著损失性能
+- 对比训练效率和最终效果的权衡
+
+## 注意事项
+
+1. **预训练模型依赖**: 必须有高质量的预训练DuoRec模型
+2. **架构匹配**: 确保RaSeRec与预训练模型的hidden_size等参数一致
+3. **温度参数重要性**: 两个分布的温度参数需要仔细调优
+4. **注意力层选择**: 不同Transformer层的注意力权重可能有不同效果
+5. **检索库质量**: 知识库的构建质量直接影响最终效果
+
+遵循以上规范可以确保正确实现基于预训练DuoRec的检索增强推荐系统。 

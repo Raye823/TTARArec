@@ -1,0 +1,103 @@
+# ======================================
+# 模型指定
+# ======================================
+model: TTARArec
+
+# ======================================
+# 预训练模型配置
+# ======================================
+pretrained_model_type: duorec  # 支持: duorec, gru4rec, cl4srec
+pretrained_model_path: "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Mar-19-2025_21-16-57-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
+
+# ======================================
+# 数据集配置
+# ======================================
+field_separator: "\t"
+seq_separator: " "
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+RATING_FIELD: rating
+TIME_FIELD: timestamp
+
+load_col:
+    inter: [user_id, item_id, rating, timestamp]
+
+NEG_PREFIX: neg_
+LABEL_FIELD: label
+ITEM_LIST_LENGTH_FIELD: item_length
+LIST_SUFFIX: _list
+MAX_ITEM_LIST_LENGTH: 50
+POSITION_FIELD: position_id
+
+min_user_inter_num: 5
+min_item_inter_num: 5
+
+# ======================================
+# 训练设置
+# ======================================
+epochs: 10
+train_batch_size: 1024
+learner: adam
+learning_rate: 0.001
+training_neg_sample_num: 0
+eval_step: 1
+stopping_step: 5
+weight_decay: 0
+
+# ======================================
+# 评估设置
+# ======================================
+eval_batch_size: 256
+eval_setting: TO_LS,full
+metrics: ["Recall", "NDCG"]
+valid_metric: Recall@10
+topk: [5, 10, 20, 50]
+
+# ======================================
+# 目录设置
+# ======================================
+log_root: "./log/"
+data_path: "./recbole/dataset"
+
+# ======================================
+# Transformer模型参数
+# ======================================
+n_layers: 2
+n_heads: 2
+hidden_size: 64
+inner_size: 256
+hidden_dropout_prob: 0.5
+attn_dropout_prob: 0.5
+hidden_act: 'gelu'
+layer_norm_eps: 1e-12
+initializer_range: 0.02
+loss_type: 'CE'
+
+# ======================================
+# DuoRec特定参数
+# ======================================
+lmd: 0.1
+lmd_sem: 0.2
+contrast: 'us_x'
+tau: 1.0
+sim: 'dot'
+
+# ======================================
+# TTARArec检索增强参数
+# ======================================
+nprobe: 1                       # Faiss检索探针数
+alpha: 0.8                       # 融合权重：alpha * 原序列 + (1-alpha) * 检索序列  
+top_k: 10                         # 检索top-k个相似序列
+low_popular: 100                 # 低热度阈值，序列长度小于此值才使用增强
+len_lower_bound: -1              # 序列长度下界，-1表示不限制
+len_upper_bound: -1              # 序列长度上界，-1表示不限制
+len_bound_reverse: True          # 是否反转长度过滤条件
+
+# ======================================
+# 检索器编码器参数
+# ======================================
+retriever_layers: 1              # 检索器MLP层数
+retriever_temperature: 0.1       # 检索分布温度参数
+recommendation_temperature: 0.1  # 推荐分布温度参数
+retriever_dropout: 0.5           # 检索器Dropout率
+kl_weight: 1                   # KL散度损失权重 

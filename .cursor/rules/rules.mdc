@@ -1,0 +1,244 @@
+---
+description: 本项目专注于推荐系统中的检索增强技术，旨在通过优化检索结果来提升推荐模型的预估性能。项目基于RecBole开源框架，集成了深度学习、注意力机制等先进技术。
+globs: 
+alwaysApply: false
+---
+# 推荐系统科研项目 - Cursor开发规范
+# ==============================================
+
+## 项目概述
+本项目专注于推荐系统中的检索增强技术，旨在通过优化检索结果来提升推荐模型的预估性能。项目基于RecBole开源框架，集成了深度学习、注意力机制等先进技术。
+
+## 技术栈和框架
+- **主框架**: RecBole (推荐系统开源框架)
+- **深度学习**: PyTorch 2.4.1+
+- **检索技术**: FAISS, 自定义检索器
+- **数据处理**: pandas, numpy, scikit-learn
+- **配置管理**: YAML配置文件
+- **实验管理**: tensorboard, logging
+
+## 代码结构规范
+
+### 1. 文件组织
+```
+项目根目录/
+├── recbole/                 # RecBole框架核心代码
+├── saved/                   # 保存的模型和检查点
+├── log/                     # 实验日志和结果
+├── *.py                     # 主要算法实现文件
+├── *.yaml                   # 模型配置文件
+├── run_*.py                 # 实验运行脚本
+└── requirements.txt         # 依赖管理
+```
+
+### 2. 命名规范
+- **模型类**: 使用PascalCase，如`FTragrec`, `DirectRetrievalTraining`
+- **函数名**: 使用snake_case，如`calculate_loss`, `retrieve_seq_tar`
+- **常量**: 使用UPPER_CASE，如`ITEM_SEQ`, `USER_ID`
+- **配置参数**: 使用snake_case，如`learning_rate`, `hidden_size`
+
+### 3. 代码注释规范
+- 每个类和重要函数必须有详细的docstring
+- 算法思路和数学公式需要详细注释
+- 实验相关的参数调整需要记录原因
+
+## 模型开发规范
+
+### 1. 检索增强模型结构
+```python
+class RetrievalAugmentedModel(nn.Module):
+    """检索增强推荐模型基类
+    
+    Args:
+        config: 模型配置
+        dataset: 数据集对象
+    """
+    
+    def __init__(self, config, dataset):
+        super().__init__()
+        # 基础推荐器
+        self.recommender = self._build_recommender(config)
+        # 检索器
+        self.retriever = self._build_retriever(config)
+        # 融合层
+        self.fusion_layer = self._build_fusion_layer(config)
+```
+
+### 2. 注意力机制实现
+- 使用标准的Multi-Head Attention结构
+- 支持可配置的头数和隐藏维度
+- 包含残差连接和层归一化
+- 添加dropout以防止过拟合
+
+### 3. 损失函数设计
+- 支持多种训练策略：recommendation_loss, ranking_loss, pointwise_loss
+- 包含对比学习损失
+- 支持多任务学习的损失组合
+
+## 实验管理规范
+
+### 1. 配置文件管理
+- 每个实验使用独立的YAML配置文件
+- 配置文件需要包含完整的超参数设置
+- 重要参数变更需要在注释中说明
+
+### 2. 实验日志
+- 使用Python logging模块记录实验过程
+- 关键指标和中间结果需要详细记录
+- 实验失败的原因和解决方案需要记录
+
+### 3. 结果保存
+- 模型检查点保存到`saved/`目录
+- 实验结果和评估指标保存到`log/`目录
+- 重要实验需要保存可复现的配置和代码快照
+
+## 性能优化规范
+
+### 1. 内存管理
+- 使用torch.no_grad()包装不需要梯度的计算
+- 及时释放不需要的张量
+- 使用混合精度训练（如需要）
+
+### 2. 计算优化
+- 批量化处理避免循环
+- 使用GPU加速（CUDA）
+- FAISS索引优化检索速度
+
+### 3. 数据加载优化
+- 使用DataLoader的多进程加载
+- 适当的batch_size设置
+- 数据预处理缓存
+
+## 评估指标规范
+
+### 1. 标准指标
+- Recall@K (K=5,10,20,50)
+- NDCG@K (K=5,10,20,50)
+- Hit Ratio@K
+- MRR (Mean Reciprocal Rank)
+
+### 2. 检索相关指标
+- 检索召回率
+- 检索精确率
+- 检索多样性指标
+
+### 3. 实验对比
+- 与基线模型的对比
+- 消融实验分析
+- 统计显著性检验
+
+## 调试和测试规范
+
+### 1. 单元测试
+- 关键函数需要编写单元测试
+- 模型前向传播的维度检查
+- 损失函数的数值稳定性测试
+
+### 2. 调试工具
+- 使用tensorboard可视化训练过程
+- 打印中间变量的形状和数值范围
+- 梯度检查和梯度爆炸监控
+
+### 3. 错误处理
+- 优雅处理CUDA内存不足
+- 数据加载异常的恢复机制
+- 模型收敛失败的诊断
+
+## 科研写作辅助
+
+### 1. 文档生成
+- 自动生成模型架构图
+- 实验结果表格自动化
+- 超参数敏感性分析图表
+
+### 2. 代码可读性
+- 算法伪代码注释
+- 数学公式的LaTeX注释
+- 参考文献链接
+
+### 3. 实验复现
+- 固定随机种子
+- 环境依赖版本锁定
+- 详细的运行说明
+
+## 常用代码模板
+
+### 1. 新模型开发模板
+```python
+class NewModel(BaseRecommender):
+    def __init__(self, config, dataset):
+        super().__init__(config, dataset)
+        # 模型组件初始化
+        
+    def forward(self, interaction):
+        # 前向传播逻辑
+        pass
+        
+    def calculate_loss(self, interaction):
+        # 损失计算
+        pass
+        
+    def predict(self, interaction):
+        # 预测逻辑
+        pass
+```
+
+### 2. 实验运行脚本模板
+```python
+from recbole.quick_start import run_recbole
+
+if __name__ == '__main__':
+    config_dict = {
+        'model': 'YourModel',
+        'dataset': 'YourDataset',
+        # 其他配置参数
+    }
+    run_recbole(model='YourModel', config_dict=config_dict)
+```
+
+## 版本控制规范
+
+### 1. Git提交规范
+- feat: 新功能
+- fix: 修复bug
+- exp: 实验相关
+- docs: 文档更新
+- refactor: 代码重构
+
+### 2. 分支管理
+- main: 稳定版本
+- develop: 开发版本
+- feature/xxx: 功能分支
+- experiment/xxx: 实验分支
+
+## 性能基准和目标
+
+### 1. 计算效率
+- 训练速度: 尽量优化batch处理
+- 内存使用: 监控GPU内存占用
+- 检索延迟: FAISS检索在合理时间内
+
+### 2. 模型效果
+- 在标准数据集上达到SOTA性能
+- 检索增强带来显著提升
+- 消融实验证明各组件有效性
+
+## 注意事项
+
+1. **数据安全**: 确保实验数据的安全和隐私
+2. **计算资源**: 合理使用GPU资源，避免资源浪费
+3. **代码质量**: 定期代码审查，保持代码整洁
+4. **实验记录**: 详细记录每次实验的设置和结果
+5. **文献调研**: 及时跟进相关领域的最新进展
+
+## 开发工作流
+
+1. **实验设计**: 明确实验目标和假设
+2. **代码实现**: 按照规范实现模型和算法
+3. **单元测试**: 确保代码正确性
+4. **实验运行**: 执行实验并记录结果
+5. **结果分析**: 分析实验结果和模型性能
+6. **论文撰写**: 整理实验结果用于论文发表
+
+
+遵循以上规范可以提高代码质量、实验效率和研究成果的可重现性。 
