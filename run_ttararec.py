@@ -79,6 +79,10 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
         logger.warning(f"初始评估失败: {e}")
         logger.info("跳过初始评估，直接开始训练...")
     
+    # 启用检索增强功能（在初始评估后，训练前）
+    logger.info("启用检索增强功能")
+    model.enable_retrieval()
+    
     # 开始训练
     logger.info("="*30)
     logger.info("开始训练TTARArec")

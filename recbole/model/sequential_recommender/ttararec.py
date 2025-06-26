@@ -22,7 +22,7 @@ from faiss import normalize_L2
 from torch import nn
 import numpy as np
 from recbole.model.abstract_recommender import SequentialRecommender
-from recbole.model.layers import activation_layer
+from recbole.model.layers import activation_layer, CrossMultiHeadAttention, FeedForward
 from recbole.model.sequential_recommender.pretrained_model_loader import PretrainedModelLoader
 import torch.nn.functional as F
 
@@ -41,40 +41,60 @@ class TTARArec(SequentialRecommender):
     def __init__(self, config, dataset):
         super(TTARArec, self).__init__(config, dataset)
 
-        # 检索相关参数
+        # ========== 1. 加载预训练模型 ==========
+        self.pretrained_model = PretrainedModelLoader.load_duorec_model(config, dataset)
+        
+        # ========== 2. 从预训练模型获取基础架构参数 ==========
+        self.hidden_size = self.pretrained_model.hidden_size
+        self.hidden_act = getattr(self.pretrained_model, 'hidden_act', config['hidden_act'] if 'hidden_act' in config else 'gelu')
+        self.initializer_range = config['initializer_range']
+
+        # ========== 3. 设置检索相关参数 ==========
+        # 检索配置参数
+        self.topk = config['top_k'] if 'top_k' in config else 10
+        self.alpha = config['alpha'] if 'alpha' in config else 0.8
+        self.nprobe = config['nprobe'] if 'nprobe' in config else 1
+        
+        # 序列长度过滤参数
         self.len_lower_bound = config["len_lower_bound"] if "len_lower_bound" in config else -1
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
-        self.nprobe = config['nprobe'] if 'nprobe' in config else 1
-        self.topk = config['top_k'] if 'top_k' in config else 10
-        self.alpha = config['alpha'] if 'alpha' in config else 0.8
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
 
-        # 检索器编码器相关参数
-        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 1
+        # ========== 4. 设置训练相关参数 ==========
+        # 温度系数和损失权重
         self.retriever_temperature = config['retriever_temperature'] if 'retriever_temperature' in config else 0.1
         self.recommendation_temperature = config['recommendation_temperature'] if 'recommendation_temperature' in config else 0.1
-        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0.1
         self.kl_weight = config['kl_weight'] if 'kl_weight' in config else 0.1
 
-        # 加载预训练模型
-        self.pretrained_model = PretrainedModelLoader.load_duorec_model(config, dataset)
+        # ========== 5. 构建检索器和融合组件 ==========
+        self._build_retrieval_components(config)
 
-        # 从预训练模型获取配置信息
-        self.hidden_size = self.pretrained_model.hidden_size
-        
-        # 从预训练模型获取架构参数（用于构建检索器编码器）
-        self.hidden_act = getattr(self.pretrained_model, 'hidden_act', config['hidden_act'] if 'hidden_act' in config else 'gelu')
-        self.initializer_range = config['initializer_range']      
-        # 构建检索器编码器组件
-        self._build_retriever_encoder()
-
-        # 初始化检索相关组件
+        # ========== 6. 初始化检索知识库相关变量 ==========
         self.dataset = dataset
-        self._init_retrieval_components()
+        self.user_id_list = None
+        self.item_seq_all = None
+        self.item_seq_len_all = None
+        self.seq_emb_knowledge = None
+        self.item_seq_knowledge = None  # 原始交互序列知识库
+        self.tar_emb_knowledge = None
+        self.seq_emb_index = None
+        self.tar_emb_index = None
+        
+        # 训练状态控制
+        self.use_retrieval = False  # 初始时不使用检索增强
 
-    def _build_retriever_encoder(self):
-        """构建检索器编码器 - 简单MLP架构"""
+    def _build_retrieval_components(self, config):
+        """构建检索器MLP层和交叉注意力融合组件"""
+        # 检索器编码器相关参数
+        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 1
+        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0.1
+                
+        # 激活函数和dropout
+        self.retriever_act_fn = activation_layer(self.hidden_act)
+        self.retriever_dropout_layer = nn.Dropout(self.retriever_dropout)
+
+        # 构建检索器MLP层
         self.retriever_mlp = nn.ModuleList()
         self.retriever_layer_norms = nn.ModuleList()
         
@@ -85,31 +105,46 @@ class TTARArec(SequentialRecommender):
             self.retriever_layer_norms.append(
                 nn.LayerNorm(self.hidden_size)
             )
-        
-        # 激活函数和dropout
-        self.retriever_act_fn = activation_layer(self.hidden_act)
-        self.retriever_dropout_layer = nn.Dropout(self.retriever_dropout)
-        
-        # 初始化检索器参数（只初始化检索器组件，不影响预训练模型）
-        self._init_retriever_modules()
 
-    def _init_retriever_modules(self):
-        """只初始化检索器组件，不影响预训练模型"""
-        # 初始化检索器MLP层
-        for layer in self.retriever_mlp:
-            if isinstance(layer, nn.Linear):
-                layer.weight.data.normal_(mean=0.0, std=self.initializer_range)
-                if layer.bias is not None:
-                    layer.bias.data.zero_()
+        # 交叉注意力融合机制参数（独立于预训练模型参数）
+        self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 2
+        self.fusion_inner_size = config['fusion_inner_size'] if 'fusion_inner_size' in config else 256
+        self.fusion_dropout_prob = config['fusion_dropout_prob'] if 'fusion_dropout_prob' in config else 0.1
+        self.fusion_layer_norm_eps = config['fusion_layer_norm_eps'] if 'fusion_layer_norm_eps' in config else 1e-12
+        self.attn_tau = config['attn_tau'] if 'attn_tau' in config else 0.2  # 注意力温度系数
         
-        # 初始化检索器LayerNorm层
+        # 交叉注意力融合机制组件
+        self.seq_tar_fusion = CrossMultiHeadAttention(
+            n_heads=self.fusion_n_heads,
+            hidden_size=self.hidden_size,
+            hidden_dropout_prob=self.fusion_dropout_prob,
+            attn_dropout_prob=self.fusion_dropout_prob,
+            layer_norm_eps=self.fusion_layer_norm_eps,
+            attn_tau=self.attn_tau
+        )
+        
+        self.fusion_ffn = FeedForward(self.hidden_size, self.fusion_inner_size, self.fusion_dropout_prob, self.hidden_act, self.fusion_layer_norm_eps)
+        
+        # 位置嵌入（用于检索序列）
+        self.fusion_position_embedding = nn.Embedding(self.topk, self.hidden_size)
+        
+        # 构建完成后立即初始化权重
+        self._init_component_weights()
+
+    def _init_component_weights(self):
+        """初始化检索器和融合组件的权重"""
+        # 初始化检索器MLP和LayerNorm
+        self.retriever_mlp.apply(self._init_weights)
         for layer_norm in self.retriever_layer_norms:
-            if isinstance(layer_norm, nn.LayerNorm):
-                layer_norm.bias.data.zero_()
-                layer_norm.weight.data.fill_(1.0)
+            self._init_weights(layer_norm)
+        
+        # 初始化交叉注意力融合机制
+        self.seq_tar_fusion.apply(self._init_weights)
+        self.fusion_ffn.apply(self._init_weights)
+        self.fusion_position_embedding.apply(self._init_weights)
 
-    def _init_retriever_weights(self, module):
-        """初始化检索器权重"""
+    def _init_weights(self, module):
+        """权重初始化回调函数"""
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
             if module.bias is not None:
@@ -117,19 +152,13 @@ class TTARArec(SequentialRecommender):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-
-    def _init_retrieval_components(self):
-        """初始化检索相关组件"""
-        # 这些属性将在precached_knowledge中设置
-        self.user_id_list = None
-        self.item_seq_all = None
-        self.item_seq_len_all = None
-        self.seq_emb_knowledge = None
-        self.item_seq_knowledge = None  # 新增：原始交互序列知识库
-        self.tar_emb_knowledge = None
-        self.seq_emb_index = None
-        self.tar_emb_index = None
-
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+            
+    def get_item_embedding(self, item_ids):
+        """获取物品嵌入 - 直接调用预训练模型"""
+        with torch.no_grad():
+            return self.pretrained_model.item_embedding(item_ids)
     def forward(self, item_seq, item_seq_len):
         """序列编码 - 直接调用预训练模型"""
         with torch.no_grad():
@@ -152,37 +181,25 @@ class TTARArec(SequentialRecommender):
             hidden = layer_norm(hidden + residual)
         
         return hidden
-
-    def get_item_embedding(self, item_ids):
-        """获取物品嵌入 - 直接调用预训练模型"""
-        with torch.no_grad():
-            return self.pretrained_model.item_embedding(item_ids)
-
-    @property
-    def item_embedding(self):
-        """兼容性属性：访问预训练模型的物品嵌入层"""
-        return self.pretrained_model.item_embedding
-
-
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
-        """使用检索增强进行序列增强"""
-        # 检索相似序列和目标嵌入
-        retrieved_seqs1, retrieved_item_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_item_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
-            seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
-        )
-
+    
+    def fusion_forward(self, seq_output, retrieved_seqs, retrieved_tars):
+        """交叉注意力融合机制前向传播"""
+        # 交叉注意力融合：query是当前序列，key是检索序列表征，value是目标嵌入
+        seq_output_expanded = seq_output.unsqueeze(1)  # [B, 1, H]
         
-        # 计算检索器编码后序列与相似序列的相似度作为权重
-        similarities = torch.sum(retriever_encoded_seq.unsqueeze(1) * retrieved_seqs1, dim=-1)  # [B, K]
-        weights = torch.softmax(similarities, dim=-1)  # [B, K]
+        # 使用交叉注意力层：query=当前序列，key=检索序列表征，value=目标嵌入
+        fused_output = self.seq_tar_fusion(
+            seq_output_expanded,        # input_query: [B, 1, H]
+            retrieved_seqs,            # input_key: [B, K, H] 
+            retrieved_tars             # input_value: [B, K, H]
+        )  # fused_output: [B, 1, H]
         
-        # 使用权重来融合对应的目标嵌入
-        weighted_retrieved = torch.sum(weights.unsqueeze(-1) * retrieved_tars1, dim=1)  # [B, H]
+        fused_output = fused_output.squeeze(1)  # [B, H]
         
-        # 与原始序列进行加权组合
-        alpha = self.alpha
-        seq_output = alpha * seq_output + (1 - alpha) * weighted_retrieved
-        return seq_output
+        # 前馈神经网络进一步处理
+        fused_output = self.fusion_ffn(fused_output)  # [B, H]
+        
+        return fused_output
 
     def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
         """检索相似序列和对应的目标嵌入以及原始交互序列"""
@@ -205,22 +222,16 @@ class TTARArec(SequentialRecommender):
         I1_filtered = np.array(I1_filtered)
         
         # 获取检索结果 - 三项内容：序列表征、原始交互序列、目标嵌入
-        retrieval_seq1 = self.seq_emb_knowledge[I1_filtered]  # 序列表征
-        retrieval_item_seq1 = self.item_seq_knowledge[I1_filtered]  # 原始交互序列
-        retrieval_tar1 = self.tar_emb_knowledge[I1_filtered]  # 目标嵌入
-        
-        retrieval_seq2 = self.seq_emb_knowledge[I1_filtered]
-        retrieval_item_seq2 = self.item_seq_knowledge[I1_filtered]
-        retrieval_tar2 = self.tar_emb_knowledge[I1_filtered]
+        retrieval_seqs = self.seq_emb_knowledge[I1_filtered]  # 序列表征
+        retrieval_item_seqs = self.item_seq_knowledge[I1_filtered]  # 原始交互序列
+        retrieval_tars = self.tar_emb_knowledge[I1_filtered]  # 目标嵌入
         
         return (
-            torch.tensor(retrieval_seq1).to("cuda"), 
-            torch.tensor(retrieval_item_seq1).to("cuda"),  # 新增返回原始交互序列
-            torch.tensor(retrieval_tar1).to("cuda"), 
-            torch.tensor(retrieval_seq2).to("cuda"), 
-            torch.tensor(retrieval_item_seq2).to("cuda"),  # 新增返回原始交互序列
-            torch.tensor(retrieval_tar2).to("cuda")
-        )
+            torch.tensor(retrieval_seqs).to("cuda"), 
+            torch.tensor(retrieval_item_seqs).to("cuda"),  # 增加返回原始交互序列
+            torch.tensor(retrieval_tars ).to("cuda"), 
+
+        )   
 
     # ============ 损失计算相关方法 ============
     
@@ -234,25 +245,25 @@ class TTARArec(SequentialRecommender):
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
         
         # 检索相似序列和目标嵌入
-        retrieved_seqs1, retrieved_item_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_item_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
+        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
             seq_output,
             batch_user_id, 
             batch_seq_len,
             topk=self.topk
         )
         
-        # 计算检索分布：基于原始序列拼接和重新编码的相似度
+        # 计算检索评分：基于原始序列拼接和重新编码的相似度
         retrieval_probs = self.compute_retrieval_scores(
-            retrieved_item_seqs1, retrieved_tars1, pos_items, item_seq, item_seq_len
+            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len
         )  # [B, K]
         
-        # 计算推荐分布：基于原序列与检索序列的点积相似度
-        recommendation_probs = self.compute_recommendation_scores(
-            seq_output, retrieved_seqs2, retrieved_tars2
+        # 计算注意力评分：基于交叉注意力权重
+        attention_probs = self.compute_attention_scores(
+            seq_output, retrieved_seqs, retrieved_tars
         )  # [B, K]
         
-        # 计算KL散度损失
-        kl_loss = self.compute_kl_loss(retrieval_probs, recommendation_probs)
+        # 计算KL散度损失（注意力评分向检索评分对齐）
+        kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
         
         # 总损失 = KL散度损失 * 权重
         total_loss = self.kl_weight * kl_loss
@@ -335,74 +346,49 @@ class TTARArec(SequentialRecommender):
         
         return retrieval_probs  # [batch_size, n_retrieved]
 
-    def compute_recommendation_scores(self, seq_output, retrieved_seqs, retrieved_tars):
-        """计算推荐分布 - 模拟预训练模型的full_sort_predict逻辑"""
-        batch_size, n_retrieved, hidden_size = retrieved_tars.size()
+    def compute_attention_scores(self, seq_output, retrieved_seqs, retrieved_tars):
+        """计算注意力评分 - 直接计算注意力权重"""
+        # 扩展当前序列输出用于注意力计算
+        seq_output_expanded = seq_output.unsqueeze(1)  # [B, 1, H]
         
-        with torch.no_grad():
-            # 重塑retrieved_tars进行批量矩阵乘法
-            retrieved_tars_t = retrieved_tars.transpose(1, 2)  # [batch_size, hidden_size, n_retrieved]
+        # 手动计算交叉注意力权重（不使用value，只计算query与key的注意力）
+        mixed_query_layer = self.seq_tar_fusion.query(seq_output_expanded)  # [B, 1, H]
+        mixed_key_layer = self.seq_tar_fusion.key(retrieved_seqs)  # [B, K, H]
+        
+        # 转换为多头形状
+        query_layer = self.seq_tar_fusion.transpose_for_scores(mixed_query_layer)  # [B, n_heads, 1, head_size]
+        key_layer = self.seq_tar_fusion.transpose_for_scores(mixed_key_layer)  # [B, n_heads, K, head_size]
+        
+        # 计算注意力得分
+        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # [B, n_heads, 1, K]
+        attention_scores = attention_scores / math.sqrt(self.seq_tar_fusion.attention_head_size)
+        
+        # 平均所有注意力头的得分
+        attention_scores = attention_scores.mean(dim=1)  # [B, 1, K]
+        attention_scores = attention_scores.squeeze(1)  # [B, K]
+        
+        # 使用温度缩放
+        attention_probs = torch.softmax(attention_scores / self.recommendation_temperature, dim=-1)
+        
+        return attention_probs
 
-            # 计算序列表示与检索目标项的相似度得分
-            scores = torch.bmm(seq_output.unsqueeze(1), retrieved_tars_t).squeeze(1)  # [B, n_retrieved]
-            
-            # 使用softmax将分数转换为概率分布
-            recommendation_scores = torch.softmax(scores, dim=-1)
-            
-        return recommendation_scores
-
-    def compute_kl_loss(self, retrieval_probs, recommendation_probs):
-        """计算检索分布与推荐分布之间的KL散度损失"""
+    def compute_kl_loss(self, attention_probs, retrieval_probs):
+        """计算注意力分布与检索分布之间的KL散度损失"""
         # 确保两个分布的维度完全匹配
-        assert retrieval_probs.shape == recommendation_probs.shape, \
-            f"形状不匹配: retrieval_probs {retrieval_probs.shape} vs recommendation_probs {recommendation_probs.shape}"
+        assert attention_probs.shape == retrieval_probs.shape, \
+            f"形状不匹配: attention_probs {attention_probs.shape} vs retrieval_probs {retrieval_probs.shape}"
         
         # 避免数值问题
         epsilon = 1e-8
+        attention_probs = attention_probs + epsilon
         retrieval_probs = retrieval_probs + epsilon
-        recommendation_probs = recommendation_probs + epsilon
         
-        # KL散度计算: KL(retrieval_probs || recommendation_probs)
-        # 优化检索分布使其接近推荐分布
-        kl_div = torch.sum(retrieval_probs * torch.log(retrieval_probs / recommendation_probs), dim=-1)
+        # KL散度计算: KL(attention_probs || retrieval_probs)
+        # 优化注意力分布使其接近检索分布
+        kl_div = torch.sum(attention_probs * torch.log(attention_probs / retrieval_probs), dim=-1)
         
         # 返回批次平均损失
         return kl_div.mean()
-
-    # ============ 预测相关方法 ============
-    
-    def predict(self, interaction):
-        """预测单个物品的得分"""
-        item_seq = interaction[self.ITEM_SEQ]
-        item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        test_item = interaction[self.ITEM_ID]
-        seq_output = self.forward(item_seq, item_seq_len)
-        test_item_emb = self.get_item_embedding(test_item)
-        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
-        return scores
-
-    def full_sort_predict(self, interaction):
-        """全排序预测 - 使用检索增强"""
-        item_seq = interaction[self.ITEM_SEQ]
-        item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        seq_output = self.forward(item_seq, item_seq_len)
-        batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
-        batch_seq_len = list(item_seq_len.detach().cpu().numpy())
-        
-        # 序列增强
-        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, mode="test")
-        
-        # 根据序列长度决定是否使用增强
-        seq_output_aug = torch.where(
-            (item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, self.hidden_size), 
-            seq_output, 
-            seq_output_aug
-        )
-        
-        # 计算与所有物品的得分
-        test_items_emb = self.pretrained_model.item_embedding.weight
-        scores = torch.matmul(seq_output_aug, test_items_emb.transpose(0, 1))  # [B, n_items]
-        return scores
 
     # ============ 知识库构建相关方法 ============
     
@@ -482,6 +468,9 @@ class TTARArec(SequentialRecommender):
         
         # 构建Faiss索引
         self._build_faiss_index()
+        
+        # 标记知识库已构建
+        self.knowledge_built = True
         print(f"知识库构建完成，包含 {len(user_id_list)} 个序列样本")
         print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
 
@@ -593,6 +582,9 @@ class TTARArec(SequentialRecommender):
         
         # 构建Faiss索引
         self._build_faiss_index()
+        
+        # 标记知识库已构建
+        self.knowledge_built = True
         print(f"验证集知识库构建完成，包含 {len(user_id_list)} 个序列样本")
         print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
 
@@ -618,3 +610,50 @@ class TTARArec(SequentialRecommender):
         self.tar_emb_index.train(tar_emb_knowledge_copy)
         self.tar_emb_index.add(tar_emb_knowledge_copy) 
         self.tar_emb_index.nprobe = self.nprobe
+
+    # ============ 预测相关方法 ============
+    def enable_retrieval(self):
+        """启用检索增强功能"""
+        self.use_retrieval = True
+
+    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
+        """序列增强 - 使用训练后的交叉注意力层进行索引融合"""
+        # 检索相似序列和目标嵌入
+        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
+            seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
+        )
+        
+        # 使用交叉注意力层获得检索信息的融合表征
+        retrieval_enhanced_output = self.fusion_forward(seq_output, retrieved_seqs, retrieved_tars)
+        
+        # 与原始序列表征进行残差连接
+        augmented_output = seq_output + retrieval_enhanced_output*0.2
+        
+        return augmented_output
+
+    def predict(self, interaction):
+        """预测单个物品的得分"""
+        item_seq = interaction[self.ITEM_SEQ]
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        test_item = interaction[self.ITEM_ID]
+        seq_output = self.forward(item_seq, item_seq_len)
+        test_item_emb = self.get_item_embedding(test_item)
+        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
+        return scores
+
+    def full_sort_predict(self, interaction):
+        """全排序预测 - 根据训练状态决定是否使用检索增强"""
+        item_seq = interaction[self.ITEM_SEQ]
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        seq_output = self.forward(item_seq, item_seq_len)
+        
+        # 根据训练状态决定是否使用检索增强
+        if self.use_retrieval:
+            batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
+            batch_seq_len = list(item_seq_len.detach().cpu().numpy())
+            seq_output = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, mode="test")
+        
+        # 计算与所有物品的得分
+        test_items_emb = self.pretrained_model.item_embedding.weight
+        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+        return scores
