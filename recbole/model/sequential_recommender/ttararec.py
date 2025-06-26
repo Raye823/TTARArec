@@ -66,6 +66,10 @@ class TTARArec(SequentialRecommender):
         self.retriever_temperature = config['retriever_temperature'] if 'retriever_temperature' in config else 0.1
         self.recommendation_temperature = config['recommendation_temperature'] if 'recommendation_temperature' in config else 0.1
         self.kl_weight = config['kl_weight'] if 'kl_weight' in config else 0.1
+        
+        # 新增损失函数权重和融合权重参数
+        self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
+        self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
 
         # ========== 5. 构建检索器和融合组件 ==========
         self._build_retrieval_components(config)
@@ -236,13 +240,21 @@ class TTARArec(SequentialRecommender):
     # ============ 损失计算相关方法 ============
     
     def calculate_loss(self, interaction):
-        """计算训练损失 - 基于KL散度对齐检索分布和推荐分布"""
+        """计算训练损失 - KL散度损失 + 推荐损失"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
         pos_items = interaction[self.POS_ITEM_ID]
         batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
-        batch_seq_len = list(item_seq_len.detach().cpu().numpy())
+        batch_seq_len = list(item_seq_len.detach().cpu().numpy())        
+
+        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
+            
+        # 计算推荐损失
+        test_item_emb = self.pretrained_model.item_embedding.weight.requires_grad_(True)
+        logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
+        rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
+
         
         # 检索相似序列和目标嵌入
         retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
@@ -265,8 +277,8 @@ class TTARArec(SequentialRecommender):
         # 计算KL散度损失（注意力评分向检索评分对齐）
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
         
-        # 总损失 = KL散度损失 * 权重
-        total_loss = self.kl_weight * kl_loss
+        # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
+        total_loss = self.kl_weight * kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
         
         return total_loss
 
@@ -626,8 +638,8 @@ class TTARArec(SequentialRecommender):
         # 使用交叉注意力层获得检索信息的融合表征
         retrieval_enhanced_output = self.fusion_forward(seq_output, retrieved_seqs, retrieved_tars)
         
-        # 与原始序列表征进行残差连接
-        augmented_output = seq_output + retrieval_enhanced_output*0.2
+        # 与原始序列表征进行加权融合
+        augmented_output = seq_output * self.fusion_weight + retrieval_enhanced_output * (1 - self.fusion_weight)
         
         return augmented_output
 
