@@ -245,8 +245,9 @@ class TTARArec(SequentialRecommender):
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
         pos_items = interaction[self.POS_ITEM_ID]
-        batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
-        batch_seq_len = list(item_seq_len.detach().cpu().numpy())        
+        # 减少CPU-GPU传输：一次性转换所有数据，避免list()转换
+        batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
+        batch_seq_len = item_seq_len.detach().cpu().numpy()        
 
         seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
             
@@ -266,7 +267,7 @@ class TTARArec(SequentialRecommender):
         
         # 计算检索评分：基于原始序列拼接和重新编码的相似度
         retrieval_probs = self.compute_retrieval_scores(
-            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len
+            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len
         )  # [B, K]
         
         # 计算注意力评分：基于交叉注意力权重
@@ -282,7 +283,7 @@ class TTARArec(SequentialRecommender):
         
         return total_loss
 
-    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len):
+    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len):
         """计算检索评分 - 基于原始序列拼接和重新编码的相似度"""
         batch_size, n_retrieved, _ = retrieved_tars.size()
         pos_items_emb = self.get_item_embedding(pos_items)  # [batch_size, hidden_size]
@@ -294,47 +295,64 @@ class TTARArec(SequentialRecommender):
             batch_new_seqs = []
             batch_new_seq_lens = []
             
-            # 为batch中每个样本处理
-            for batch_idx in range(batch_size):
-                # 获取当前输入的原始序列和长度
-                current_item_seq = item_seq[batch_idx]  # [max_seq_len]
-                current_seq_len = item_seq_len[batch_idx].item()  # 标量
-                
-                # 获取检索到的原始序列
-                retrieved_item_seq = retrieved_item_seqs[batch_idx, i, :]  # [max_seq_len]
-                
-                # 找到检索序列的有效长度（去掉padding的0）
-                retrieved_seq_len = 0
-                for j in range(retrieved_item_seq.size(0)):
-                    if retrieved_item_seq[j].item() != 0:
-                        retrieved_seq_len += 1
-                    else:
-                        break
-                
-                # 拼接序列：当前序列的有效部分 + 检索到的序列的有效部分
-                current_valid_seq = current_item_seq[:current_seq_len]
-                retrieved_valid_seq = retrieved_item_seq[:retrieved_seq_len]
-                
-                # 拼接后的新序列
-                new_seq = torch.cat([current_valid_seq, retrieved_valid_seq])
-                new_seq_len = current_seq_len + retrieved_seq_len
-                
-                # 使用固定的最大长度，如果超出则截断保留最近的交互
-                max_seq_len = item_seq.size(1)
-                if new_seq_len > max_seq_len:
-                    new_seq = new_seq[-max_seq_len:]  # 保留最近的交互
-                    new_seq_len = max_seq_len
-                
-                # 填充到固定长度
-                padded_new_seq = torch.zeros(max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
-                padded_new_seq[:new_seq_len] = new_seq
-                
-                batch_new_seqs.append(padded_new_seq)
-                batch_new_seq_lens.append(new_seq_len)
+            # 批量处理所有样本 - 大幅优化内层循环
             
-            # 将batch中的新序列堆叠
-            batch_new_seqs = torch.stack(batch_new_seqs, dim=0)  # [batch_size, max_seq_len]
-            batch_new_seq_lens = torch.tensor(batch_new_seq_lens, device=item_seq.device)  # [batch_size]
+            # 预分配结果张量
+            max_seq_len = item_seq.size(1)
+            batch_new_seqs = torch.zeros(batch_size, max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
+            batch_new_seq_lens = torch.zeros(batch_size, dtype=torch.long, device=item_seq.device)
+            
+            # 批量计算检索序列的有效长度
+            retrieved_seqs_i = retrieved_item_seqs[:, i, :]  # [batch_size, max_seq_len]
+            
+            # 使用向量化操作找到有效长度
+            nonzero_masks = (retrieved_seqs_i != 0)  # [batch_size, max_seq_len]
+            # 找到每行最后一个非零位置
+            seq_lens = torch.sum(nonzero_masks, dim=1)  # [batch_size] 直接计算非零元素数量
+            
+            # 完全向量化处理 - 真正消除batch_size循环！
+            current_seq_lens = torch.from_numpy(batch_seq_len).to(item_seq.device)
+            
+            # 方法：使用gather和scatter操作进行向量化拼接
+            # 1. 计算新序列长度
+            total_lens = current_seq_lens + seq_lens
+            new_seq_lens = torch.clamp(total_lens, max=max_seq_len)
+            
+            # 2. 创建一个大的拼接张量 [batch_size, 2*max_seq_len]
+            # 前半部分放原序列，后半部分放检索序列
+            concat_seqs = torch.zeros(batch_size, 2 * max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
+            concat_seqs[:, :max_seq_len] = item_seq
+            concat_seqs[:, max_seq_len:] = retrieved_seqs_i
+            
+            # 3. 为每个样本创建索引，从concat_seqs中选择正确的元素
+            batch_indices = torch.arange(batch_size, device=item_seq.device).unsqueeze(1)
+            
+            # 4. 创建序列索引：对于每个位置，决定从原序列还是检索序列取值
+            position_indices = torch.arange(max_seq_len, device=item_seq.device).unsqueeze(0).expand(batch_size, -1)
+            
+            # 原序列部分的掩码
+            current_mask = position_indices < current_seq_lens.unsqueeze(1)
+            # 检索序列部分的掩码（从原序列长度开始）
+            retrieved_start_pos = current_seq_lens.unsqueeze(1)
+            retrieved_mask = (position_indices >= retrieved_start_pos) & (position_indices < new_seq_lens.unsqueeze(1))
+            
+            # 5. 构建最终序列
+            batch_new_seqs = torch.zeros_like(item_seq)
+            
+            # 复制原序列
+            batch_new_seqs[current_mask] = item_seq[current_mask]
+            
+            # 添加检索序列（需要计算正确的检索序列位置）
+            if retrieved_mask.any():
+                # 计算检索序列中的相对位置
+                retrieved_relative_pos = position_indices - retrieved_start_pos
+                retrieved_relative_pos = torch.clamp(retrieved_relative_pos, min=0, max=max_seq_len-1)
+                
+                # 从检索序列中获取正确的值
+                retrieved_values = retrieved_seqs_i[batch_indices.expand(-1, max_seq_len), retrieved_relative_pos]
+                batch_new_seqs[retrieved_mask] = retrieved_values[retrieved_mask]
+            
+            batch_new_seq_lens = new_seq_lens
             
             # 使用DuoRec编码器重新编码新序列
             new_seq_output = self.forward(batch_new_seqs, batch_new_seq_lens)  # [batch_size, hidden_size]
