@@ -52,7 +52,6 @@ class TTARArec(SequentialRecommender):
         # ========== 3. 设置检索相关参数 ==========
         # 检索配置参数
         self.topk = config['top_k'] if 'top_k' in config else 10
-        self.alpha = config['alpha'] if 'alpha' in config else 0.8
         self.nprobe = config['nprobe'] if 'nprobe' in config else 1
         
         # 序列长度过滤参数
@@ -65,7 +64,6 @@ class TTARArec(SequentialRecommender):
         # 温度系数和损失权重
         self.retriever_temperature = config['retriever_temperature'] if 'retriever_temperature' in config else 0.1
         self.recommendation_temperature = config['recommendation_temperature'] if 'recommendation_temperature' in config else 0.1
-        self.kl_weight = config['kl_weight'] if 'kl_weight' in config else 0.1
         
         # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
@@ -264,7 +262,7 @@ class TTARArec(SequentialRecommender):
             batch_seq_len,
             topk=self.topk
         )
-        
+
         # 计算检索评分：基于原始序列拼接和重新编码的相似度
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len
@@ -279,7 +277,7 @@ class TTARArec(SequentialRecommender):
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
         
         # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
-        total_loss = self.kl_weight * kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
+        total_loss = kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
         
         return total_loss
 

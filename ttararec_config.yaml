@@ -60,8 +60,8 @@ min_item_inter_num: 5
 # ======================================
 # 训练设置
 # ======================================
-epochs: 5
-train_batch_size: 1024
+epochs: 20
+train_batch_size: 4096
 learner: adam
 learning_rate: 0.001
 training_neg_sample_num: 0
@@ -82,7 +82,6 @@ topk: [5, 10, 20, 50]
 # TTARArec检索增强参数
 # ======================================
 nprobe: 1                       # Faiss检索探针数
-alpha: 0.8                       # 融合权重：alpha * 原序列 + (1-alpha) * 检索序列  
 top_k: 10                         # 检索top-k个相似序列
 low_popular: 100                 # 低热度阈值，序列长度小于此值才使用增强
 len_lower_bound: -1              # 序列长度下界，-1表示不限制
@@ -95,20 +94,20 @@ len_bound_reverse: True          # 是否反转长度过滤条件
 retriever_layers: 1              # 检索器MLP层数
 retriever_temperature: 0.1       # 检索分布温度参数
 recommendation_temperature: 0.1  # 推荐分布温度参数
-retriever_dropout: 0.5           # 检索器Dropout率
-kl_weight: 1                   # KL散度损失权重 
+retriever_dropout: 0.3           # 检索器Dropout率
+
 
 # ======================================
 # 交叉注意力融合机制参数（独立于预训练模型）
 # ======================================
 fusion_n_heads: 2               # 交叉注意力头数
 fusion_inner_size: 256          # 交叉注意力FFN内部维度
-fusion_dropout_prob: 0.1        # 交叉注意力dropout概率
+fusion_dropout_prob: 0.3        # 交叉注意力dropout概率
 fusion_layer_norm_eps: 1e-12    # 交叉注意力LayerNorm epsilon
-attn_tau: 0.2                   # 注意力温度系数，控制注意力分布的锐度
+attn_tau: 0.5                   # 注意力温度系数，控制注意力分布的锐度
 
 # ======================================
 # 损失函数和融合权重参数
 # ======================================
 kl_loss_weight: 0.8             # KL散度损失权重
-fusion_weight: 0.8               # 序列增强时的融合权重：fusion_weight*原序列 + (1-fusion_weight)*检索增强 
+fusion_weight: 0.8               # 序列增强时的融合权重：fusion_weight*原序列 + (1-fusion_weight)*检索增强
