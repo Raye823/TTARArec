@@ -67,17 +67,15 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     trainer = get_trainer(config['MODEL_TYPE'], config['model'])(config, model)
     
     # 在训练前进行一次评估
-    try:
-        valid_score, valid_result = trainer._valid_epoch(valid_data, show_progress=config['show_progress'])
-        logger.info(set_color('初始验证结果', 'blue') + f': {valid_score}')
-        logger.info(set_color('详细验证结果', 'blue') + f': {valid_result}')
+
+    valid_score, valid_result = trainer._valid_epoch(valid_data, show_progress=config['show_progress'])
+    logger.info(set_color('初始验证结果', 'blue') + f': {valid_score}')
+    logger.info(set_color('详细验证结果', 'blue') + f': {valid_result}')
         
-        # 测试集评估
-        test_result = trainer.evaluate(test_data, load_best_model=False, show_progress=config['show_progress'])
-        logger.info(set_color('初始测试结果', 'blue') + f': {test_result}')
-    except Exception as e:
-        logger.warning(f"初始评估失败: {e}")
-        logger.info("跳过初始评估，直接开始训练...")
+    # 测试集评估
+    test_result = trainer.evaluate(test_data, load_best_model=False, show_progress=config['show_progress'])
+    logger.info(set_color('初始测试结果', 'blue') + f': {test_result}')
+
     
     # 启用检索增强功能（在初始评估后，训练前）
     logger.info("启用检索增强功能")
@@ -95,11 +93,8 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     logger.info("="*30)
     logger.info("最佳模型评估")
     logger.info("="*30)
+    model.precached_knowledge_val(valid_data)
     test_result = trainer.evaluate(test_data, load_best_model=saved, show_progress=config['show_progress'])
-    
-    logger.info("="*50)
-    logger.info("TTARArec 训练完成!")
-    logger.info("="*50)
     logger.info(set_color('最佳验证结果', 'green') + f': {best_valid_result}')
     logger.info(set_color('最终测试结果', 'green') + f': {test_result}')
     

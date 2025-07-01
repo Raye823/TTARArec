@@ -236,50 +236,6 @@ class TTARArec(SequentialRecommender):
         )   
 
     # ============ 损失计算相关方法 ============
-    
-    def calculate_loss(self, interaction):
-        """计算训练损失 - KL散度损失 + 推荐损失"""
-        item_seq = interaction[self.ITEM_SEQ]
-        item_seq_len = interaction[self.ITEM_SEQ_LEN]
-        seq_output = self.forward(item_seq, item_seq_len)
-        pos_items = interaction[self.POS_ITEM_ID]
-        # 减少CPU-GPU传输：一次性转换所有数据，避免list()转换
-        batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
-        batch_seq_len = item_seq_len.detach().cpu().numpy()        
-
-        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
-            
-        # 计算推荐损失
-        test_item_emb = self.pretrained_model.item_embedding.weight.requires_grad_(True)
-        logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
-        rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
-
-        
-        # 检索相似序列和目标嵌入
-        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
-            seq_output,
-            batch_user_id, 
-            batch_seq_len,
-            topk=self.topk
-        )
-
-        # 计算检索评分：基于原始序列拼接和重新编码的相似度
-        retrieval_probs = self.compute_retrieval_scores(
-            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len
-        )  # [B, K]
-        
-        # 计算注意力评分：基于交叉注意力权重
-        attention_probs = self.compute_attention_scores(
-            seq_output, retrieved_seqs, retrieved_tars
-        )  # [B, K]
-        
-        # 计算KL散度损失（注意力评分向检索评分对齐）
-        kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
-        
-        # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
-        total_loss = kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
-        
-        return total_loss
 
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len):
         """计算检索评分 - 基于原始序列拼接和重新编码的相似度"""
@@ -417,6 +373,50 @@ class TTARArec(SequentialRecommender):
         
         # 返回批次平均损失
         return kl_div.mean()
+
+    def calculate_loss(self, interaction):
+        """计算训练损失 - KL散度损失 + 推荐损失"""
+        item_seq = interaction[self.ITEM_SEQ]
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        seq_output = self.forward(item_seq, item_seq_len)
+        pos_items = interaction[self.POS_ITEM_ID]
+        # 减少CPU-GPU传输：一次性转换所有数据，避免list()转换
+        batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
+        batch_seq_len = item_seq_len.detach().cpu().numpy()        
+
+        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
+            
+        # 计算推荐损失
+        test_item_emb = self.pretrained_model.item_embedding.weight.requires_grad_(True)
+        logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
+        rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
+
+        
+        # 检索相似序列和目标嵌入
+        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
+            seq_output,
+            batch_user_id, 
+            batch_seq_len,
+            topk=self.topk
+        )
+
+        # 计算检索评分：基于原始序列拼接和重新编码的相似度
+        retrieval_probs = self.compute_retrieval_scores(
+            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len
+        )  # [B, K]
+        
+        # 计算注意力评分：基于交叉注意力权重
+        attention_probs = self.compute_attention_scores(
+            seq_output, retrieved_seqs, retrieved_tars
+        )  # [B, K]
+        
+        # 计算KL散度损失（注意力评分向检索评分对齐）
+        kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
+        
+        # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
+        total_loss = kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
+        
+        return total_loss
 
     # ============ 知识库构建相关方法 ============
     

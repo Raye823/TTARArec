@@ -17,3 +17,4 @@ python run_ttararec.py --dataset Amazon_Beauty --pretrained_model_path "./log/Du
 6.融合改为序列
 7.知识库构建方式切分序列
 8.学习率、参数数量调整
+9.随机种子
