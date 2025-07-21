@@ -1,0 +1,164 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{CJKutf8}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{longtable}
+\usepackage{multirow}
+\usepackage{multicol}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{verbatim}
+
+% 页面设置
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+
+% 超链接设置
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=cyan,
+}
+
+\title{检索增强推荐系统实验结果}
+\author{实验记录}
+\date{\today}
+
+\begin{document}
+\begin{CJK}{UTF8}{gbsn}
+
+\maketitle
+
+\section{融合索引后性能和KL散度对齐效果（核心问题）}
+
+本次实验基于TTARArec模型，通过检索增强技术提升序列推荐性能。实验中实现了三个关键的索引一致性指标来分析检索增强机制的有效性：
+
+\begin{enumerate}
+    \item Top-1选择一致性：检索评分最高索引与注意力评分最高索引的一致性
+    \item 最佳增强效果索引一致性：实际最有效的增强索引与表征相似度最高索引的一致性
+    \item 融合权重最高索引一致性：交叉注意力融合时权重最高索引与表征相似度最高索引的一致性
+\end{enumerate}
+
+\subsection{关键数据}
+
+在第33个batch的训练过程中，观察到以下关键指标：
+
+\begin{table}[H]
+\centering
+\caption{实验关键指标}
+\begin{tabular}{@{}lr@{}}
+\toprule
+指标 & 数值 \\
+\midrule
+Top-1选择一致性 & 14.62\% \\
+最佳增强效果索引与表征相似度最高索引一致性 & 15.58\% \\
+融合权重最高索引与表征相似度最高索引一致性 & 29.22\% \\
+\midrule
+原始序列与增强序列相似度 & 0.966132 \\
+原始序列与目标项相似度 & 4.225115 \\
+增强序列与目标项相似度 & 4.302148 \\
+增强带来的相似度提升 & 0.077033 \\
+\midrule
+最佳检索序列拼接后相似度 & 4.891777 \\
+检索器潜在提升空间 & 0.666662 \\
+融合机制利用率 & 11.56\% \\
+\bottomrule
+\end{tabular}
+\label{tab:debug_results}
+\end{table}
+
+\subsection{主要发现}
+
+\subsubsection{表征相似度与实际效果不一致}
+最佳增强效果索引与表征相似度最高索引的一致性仅为15.58\%，说明表征相似度高的检索结果并不一定带来最好的推荐效果。
+
+\subsubsection{融合模块学习偏向问题}
+融合权重最高索引与表征相似度最高索引的一致性为29.22\%，明显高于实际效果一致性，表明融合模块更倾向于关注表征相似度高的索引。
+
+\subsubsection{融合机制利用率低}
+融合机制利用率仅为11.56\%，远低于理论潜在提升空间（0.666662），说明融合机制没有充分利用检索到的有用信息。
+
+\subsection{结论}
+实验结果表明，当前基于表征相似度的检索策略与实际推荐效果之间存在根本性不一致。相似性和有用性之间存在显著差距，这是检索增强推荐系统中需要解决的核心问题。
+
+\section{Attention层结构优化}
+
+\subsection{Value矩阵训练问题}
+% 待填充：关于attention层结构中没有训练value矩阵的实验结果
+
+\subsection{推荐损失监督信号}
+% 待填充：推荐损失提供监督信号的实验结果
+
+\section{检索评分机制改进}
+
+\subsection{MLP层必要性验证}
+% 待填充：检索评分是否有必要加上mlp层的实验结果
+
+\subsection{检索任务适应性}
+% 待填充：适应检索任务的实验结果
+
+\section{Attention结构与位置编码}
+
+\subsection{Attention结构设计}
+% 待填充：attention结构以及应用位置编码的实验结果
+
+\subsection{模型性能影响}
+% 待填充：模型性能没提升的分析
+
+\section{损失函数权重调整}
+
+\subsection{推荐损失权重设置}
+% 待填充：推荐损失权重设置为1的实验结果
+
+\subsection{KL散度问题分析}
+% 待填充：kl散度太大的问题分析，包括索引数量k值影响、batchsize影响、dropout影响
+
+\section{融合机制改进}
+
+\subsection{序列融合方式}
+% 待填充：融合改为序列的实验结果
+
+\subsection{知识库构建方式修改}
+% 待填充：修改知识库构建方式的实验结果，提升不明显的分析
+
+\subsection{性能提升效果}
+% 待填充：模型性能没提升的分析
+
+\section{参数数量调整}
+
+\subsection{注意力头数(head)调整}
+% 待填充：注意力头数调整的实验结果
+
+\subsection{MLP层参数(mlp)调整}
+% 待填充：MLP层参数调整的实验结果
+
+\subsection{内部维度(inner_size)调整}
+% 待填充：内部维度调整的实验结果
+
+\section{超参数调优}
+
+\subsection{基础训练参数}
+% 待填充：learning_rate、train_batch_size调优结果
+
+\subsection{检索相关参数}
+% 待填充：nprobe调优结果
+
+\subsection{正则化参数}
+% 待填充：dropout调优结果
+
+\subsection{温度和注意力参数}
+% 待填充：temperature、attn_tau调优结果
+
+\subsection{损失函数权重参数}
+% 待填充：kl_loss_weight、fusion_weight调优结果
+
+\end{CJK}
+\end{document}
+
