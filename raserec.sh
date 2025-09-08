@@ -8,7 +8,6 @@ python run_seq.py --dataset='Amazon_Beauty' --gpu_id=0 --metrics="['Recall', 'ND
 python run_seq.py --dataset='Amazon_Beauty'  --pretrained_path="./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Mar-19-2025_21-16-57-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
 
 python run_ttararec.py --dataset Amazon_Beauty --pretrained_model_path "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Mar-19-2025_21-16-57-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
-python run_ttararec_wandb.py --dataset Amazon_Beauty --pretrained_model_path "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Mar-19-2025_21-16-57-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
 
 1.attention层结构,没有训练value矩阵;推荐损失提供监督信号
 2.检索评分是否有必要加上mlp;适应检索任务(待验证)
@@ -21,3 +20,5 @@ python run_ttararec_wandb.py --dataset Amazon_Beauty --pretrained_model_path "./
 9.超参数调参(learning_rate\train_batch_size\nprobe\dropout\temperature\attn_tau\kl_loss_weight\fusion_weight)
 10.检查融合索引后性能和kl散度对齐效果
 11.wandb;网络不行
+
+除此之外是否可以在检索评分中也加入负样本？取与真实下一项y最相似的k个item，不仅对加上索引再编码后的序列与真实下一项做相似度计算，也与k个负样本做相似度计算，然后下一步该怎么做才能提供负信号？

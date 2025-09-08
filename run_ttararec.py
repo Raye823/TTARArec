@@ -2,10 +2,88 @@ import argparse
 import torch
 import logging
 from logging import getLogger
+from typing import Dict, List, Optional
 from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
 from recbole.utils import init_logger, get_model, get_trainer, init_seed
 from recbole.utils.utils import set_color
+from recbole.utils.ttararec_diagnostics import get_attention_grad_norms
+
+
+def print_grad_norms(
+    model,
+    batch_idx: int,
+    every: int = 129,
+    names_of_interest: Optional[List[str]] = None,
+) -> None:
+    """在 backward() 后、optimizer.step() 前调用，按频率打印梯度范数。"""
+    if (batch_idx % every) != 0:
+        return
+
+    norms: Dict[str, float] = {}
+    norms = get_attention_grad_norms(model)
+    # 兜底：遍历参数梯度
+    if not norms:
+        for name, p in model.named_parameters():
+            if p.grad is None:
+                continue
+            norms[name] = p.grad.data.norm().item()
+
+    # 可选过滤
+    if names_of_interest:
+        norms = {k: v for k, v in norms.items() if any(tag in k for tag in names_of_interest)}
+
+    print(f"Batch {batch_idx} 梯度范数:")
+    for name, norm in norms.items():
+        print(f"  {name}: {norm:.6f}")
+    print()
+
+
+class GradNormTrainer:
+    """梯度范数打印的Trainer混入类"""
+    
+    def _train_epoch(self, train_data, epoch_idx, loss_func=None, show_progress=False):
+        """重写训练epoch方法，添加梯度范数打印"""
+        from tqdm import tqdm
+        
+        self.model.train()
+        loss_func = loss_func or self.model.calculate_loss
+        total_loss = None
+        iter_data = (
+            tqdm(
+                train_data,
+                total=len(train_data),
+                ncols=100,
+                desc=f'Training epoch {epoch_idx}'
+            ) if show_progress else train_data
+        )
+        
+        for batch_idx, interaction in enumerate(iter_data):
+            interaction = interaction.to(self.device)
+            self.optimizer.zero_grad()
+            losses = loss_func(interaction)
+            
+            if isinstance(losses, tuple):
+                loss = sum(losses)
+                loss_tuple = tuple(per_loss.item() for per_loss in losses)
+                total_loss = loss_tuple if total_loss is None else tuple(map(sum, zip(total_loss, loss_tuple)))
+            else:
+                loss = losses
+                total_loss = losses.item() if total_loss is None else total_loss + losses.item()
+            
+            self._check_nan(loss)
+            loss.backward()
+            
+            # 添加梯度范数打印
+            print_grad_norms(self.model, batch_idx, every=129)
+            
+            if self.clip_grad_norm:
+                from torch.nn.utils.clip_grad import clip_grad_norm_
+                clip_grad_norm_(self.model.parameters(), **self.clip_grad_norm)
+            
+            self.optimizer.step()
+            
+        return total_loss
 
 
 def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=None, saved=True):
@@ -65,6 +143,14 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     
     # 加载trainer
     trainer = get_trainer(config['MODEL_TYPE'], config['model'])(config, model)
+    
+    # 为trainer添加梯度范数打印功能
+    trainer_class = trainer.__class__
+    class CustomTrainer(GradNormTrainer, trainer_class):
+        pass
+    
+    # 使用新的trainer类创建实例
+    trainer = CustomTrainer(config, model)
     
     # 在训练前进行一次评估
 

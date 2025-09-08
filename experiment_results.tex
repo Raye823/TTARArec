@@ -15,6 +15,10 @@
 \usepackage{geometry}
 \usepackage{hyperref}
 \usepackage{verbatim}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{shapes,arrows,positioning,fit,backgrounds}
 
 % 页面设置
 \geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
@@ -36,129 +40,329 @@
 
 \maketitle
 
+\section{TTARArec模型架构}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[
+    node distance=0.8cm and 1.5cm,
+    block/.style={rectangle, draw, fill=blue!20, text width=2.5cm, text centered, minimum height=0.8cm, font=\small},
+    retrieval/.style={rectangle, draw, fill=red!20, text width=2.5cm, text centered, minimum height=0.8cm, font=\small},
+    attention/.style={rectangle, draw, fill=green!30, text width=2.5cm, text centered, minimum height=0.8cm, font=\small},
+    kl/.style={rectangle, draw, fill=purple!20, text width=3cm, text centered, minimum height=0.8cm, font=\small},
+    arrow/.style={thick,->,>=stealth}
+]
+
+% 输入层
+\node[block] (input) {Input Sequence\\$x = [x_1, ..., x_n]$};
+
+% DuoRec编码
+\node[block, below=of input] (duorec) {DuoRec Encoding\\$h_{seq}$ [Frozen]};
+
+% Faiss检索
+\node[block, below=of duorec, fill=yellow!20] (faiss) {FAISS Retrieval\\Top-k};
+
+% 左侧路径：检索分数
+\node[retrieval, below left=of faiss, xshift=-1.5cm] (path_a) {Path A\\(Teacher)};
+\node[retrieval, below=of path_a] (concat) {Concatenation\\$[x] + [r_i]$};
+\node[retrieval, below=of concat] (reencoding) {Re-encoding\\$h_{concat}$};
+\node[retrieval, below=of reencoding] (mlp) {MLP\\(Trainable)};
+\node[retrieval, below=of mlp] (retrieval_probs) {$P_{retrieval}$};
+
+% 右侧路径：注意力分数
+\node[attention, below right=of faiss, xshift=1.5cm] (path_b) {Path B\\(Student)};
+\node[attention, below=of path_b] (query_trans) {Query\\$Q = W_q h_{seq}$};
+\node[attention, below=of query_trans] (key_trans) {Key\\$K = W_k r_{seqs}$};
+\node[attention, below=of key_trans] (attn_comp) {Attention\\$QK^T/\sqrt{d_k}$};
+\node[attention, below=of attn_comp] (attention_probs) {$P_{attention}$};
+
+% KL散度对齐
+\node[kl, below=of faiss, yshift=-6cm] (kl_div) {KL Divergence\\$\text{KL}(P_{att} || P_{ret})$};
+
+% 连接线
+\draw[arrow] (input) -- (duorec);
+\draw[arrow] (duorec) -- (faiss);
+\draw[arrow] (faiss) -| (path_a);
+\draw[arrow] (path_a) -- (concat);
+\draw[arrow] (concat) -- (reencoding);
+\draw[arrow] (reencoding) -- (mlp);
+\draw[arrow] (mlp) -- (retrieval_probs);
+
+\draw[arrow] (faiss) -| (path_b);
+\draw[arrow] (path_b) -- (query_trans);
+\draw[arrow] (query_trans) -- (key_trans);
+\draw[arrow] (key_trans) -- (attn_comp);
+\draw[arrow] (attn_comp) -- (attention_probs);
+
+\draw[arrow] (retrieval_probs) -- (kl_div);
+\draw[arrow] (attention_probs) -- (kl_div);
+
+\end{tikzpicture}
+}
+\caption{TTARArec模型架构：KL散度对齐机制}
+\label{fig:model_architecture}
+\end{figure}
+
+\subsection{模型架构说明}
+
+TTARArec模型采用双路径架构，通过KL散度损失实现注意力评分与检索评分的对齐：
+
+\textbf{核心思想}：让注意力机制学习检索评分的索引选择模式，从而识别真正有用的检索索引。
+
+\textbf{左侧路径（检索评分 - 教师信号）}：
+\begin{itemize}
+    \item 将原始序列与每个检索序列拼接
+    \item 通过冻结的DuoRec重新编码获得增强表征
+    \item 使用可训练的MLP层处理表征
+    \item 计算与正样本项目的相似度作为检索评分
+\end{itemize}
+
+\textbf{右侧路径（注意力评分 - 学生网络）}：
+\begin{itemize}
+    \item 使用交叉注意力机制计算原始序列与检索序列的注意力权重
+    \item Query来自原始序列表征，Key来自检索序列表征
+    \item 通过可训练的Query/Key变换矩阵学习注意力模式
+\end{itemize}
+
+\textbf{KL散度对齐}：
+\begin{itemize}
+    \item $L_{KL} = \text{KL}(P_{attention} || P_{retrieval})$
+    \item 强制注意力分布向检索分布对齐
+    \item 更新参数：检索器MLP + 交叉注意力Query/Key矩阵
+\end{itemize}
+
+% 1.2 详细网络结构
+\subsection{详细网络结构}
+\begin{verbatim}
+(pretrained_model): DuoRec(
+    (item_embedding): Embedding(12102, 64, padding_idx=0)
+    (position_embedding): Embedding(50, 64)
+    (trm_encoder): TransformerEncoder(
+      (layer): ModuleList(
+        (0-1): 2 x TransformerLayer(
+          (multi_head_attention): MultiHeadAttention(
+            (query): Linear(in_features=64, out_features=64, bias=True)
+            (key): Linear(in_features=64, out_features=64, bias=True)
+            (value): Linear(in_features=64, out_features=64, bias=True)
+            (attn_dropout): Dropout(p=0.5, inplace=False)
+            (dense): Linear(in_features=64, out_features=64, bias=True)
+            (LayerNorm): LayerNorm((64,), eps=1e-12, elementwise_affine=True)
+            (out_dropout): Dropout(p=0.5, inplace=False)
+          )
+          (feed_forward): FeedForward(
+            (dense_1): Linear(in_features=64, out_features=256, bias=True)
+            (dense_2): Linear(in_features=256, out_features=64, bias=True)
+            (LayerNorm): LayerNorm((64,), eps=1e-12, elementwise_affine=True)
+            (dropout): Dropout(p=0.5, inplace=False)
+          )
+        )
+      )
+    )
+    (LayerNorm): LayerNorm((64,), eps=1e-12, elementwise_affine=True)
+    (dropout): Dropout(p=0.5, inplace=False)
+    (loss_fct): CrossEntropyLoss()
+    (aug_nce_fct): CrossEntropyLoss()
+    (sem_aug_nce_fct): CrossEntropyLoss()
+)
+(retriever_act_fn): GELU(approximate='none')
+(retriever_dropout_layer): Dropout(p=0, inplace=False)
+(retriever_mlp): ModuleList()
+(retriever_layer_norms): ModuleList()
+(seq_tar_fusion): CrossMultiHeadAttention(
+    (query): Linear(in_features=64, out_features=64, bias=True)
+    (key): Linear(in_features=64, out_features=64, bias=True)
+    (value): Linear(in_features=64, out_features=64, bias=True)
+    (attn_dropout): Dropout(p=0.5, inplace=False)
+    (dense): Linear(in_features=64, out_features=64, bias=True)
+    (LayerNorm): LayerNorm((64,), eps=1e-12, elementwise_affine=True)
+    (out_dropout): Dropout(p=0.5, inplace=False)
+)
+(fusion_ffn): FeedForward(
+    (dense_1): Linear(in_features=64, out_features=256, bias=True)
+    (dense_2): Linear(in_features=256, out_features=64, bias=True)
+    (LayerNorm): LayerNorm((64,), eps=1e-12, elementwise_affine=True)
+    (dropout): Dropout(p=0.5, inplace=False)
+)
+(fusion_position_embedding): Embedding(10, 64)
+\end{verbatim}
+
+\begin{figure}[H]
+\centering
+\resizebox{\textwidth}{!}{
+\begin{tikzpicture}[
+    node distance=0.9cm and 1.6cm,
+    blk/.style={rectangle, draw, fill=blue!15, rounded corners, minimum width=2.9cm, minimum height=0.9cm, align=center, font=\small},
+    attn/.style={rectangle, draw, fill=green!20, rounded corners, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+    ffn/.style={rectangle, draw, fill=orange!20, rounded corners, minimum width=3.2cm, minimum height=0.9cm, align=center, font=\small},
+    data/.style={rectangle, draw, fill=gray!10, rounded corners, minimum width=2.6cm, minimum height=0.8cm, align=center, font=\small},
+    arrow/.style={thick,->,>=stealth}
+]
+
+% 左：DuoRec 编码器
+\node[data] (inp) {item\_seq};
+\node[blk, below=of inp] (emb) {item/pos Embedding};
+\node[blk, below=of emb] (trm1) {TransformerLayer\,\#1};
+\node[blk, below=of trm1] (trm2) {TransformerLayer\,\#2};
+\node[blk, below=of trm2] (ln) {LayerNorm + Dropout};
+\node[data, below=of ln] (hseq) {$h_{seq}$};
+
+\draw[arrow] (inp) -- (emb);
+\draw[arrow] (emb) -- (trm1);
+\draw[arrow] (trm1) -- (trm2);
+\draw[arrow] (trm2) -- (ln);
+\draw[arrow] (ln) -- (hseq);
+
+% 右：检索候选（抽象表示）
+\node[data, right=5.2cm of trm1] (rseqs) {retrieved\_seqs [B,K,H]};
+\node[data, below=of rseqs] (rtars) {retrieved\_tars [B,K,H]};
+
+% 交叉注意力 + FFN
+\node[attn, below=0.4cm of hseq, right=3.4cm of hseq] (xattn) {CrossMultiHeadAttention\\(Q=h\_{seq}, K=r\_{seqs}, V=r\_{tars})};
+\node[ffn, below=of xattn] (ffn) {FeedForward (256) \rightarrow 64};
+\node[data, below=of ffn] (hout) {$h_{aug}$};
+
+\draw[arrow] (hseq.east) -- (xattn.west);
+\draw[arrow] (rseqs.west) -- (xattn.north east);
+\draw[arrow] (rtars.west) -- (xattn.south east);
+\draw[arrow] (xattn) -- (ffn);
+\draw[arrow] (ffn) -- (hout);
+
+\end{tikzpicture}
+}
+\caption{TTARArec 模块级网络结构示意图}
+\label{fig:ttara_module_graph}
+\end{figure}
+
+\subsection{可训练参数}
+\begin{verbatim}
+===== 可训练参数列表（requires_grad=True） =====
+- seq_tar_fusion.query.weight: shape=(64, 64)
+- seq_tar_fusion.query.bias: shape=(64,)
+- seq_tar_fusion.key.weight: shape=(64, 64)
+- seq_tar_fusion.key.bias: shape=(64,)
+- seq_tar_fusion.value.weight: shape=(64, 64)
+- seq_tar_fusion.value.bias: shape=(64,)
+- seq_tar_fusion.dense.weight: shape=(64, 64)
+- seq_tar_fusion.dense.bias: shape=(64,)
+- seq_tar_fusion.LayerNorm.weight: shape=(64,)
+- seq_tar_fusion.LayerNorm.bias: shape=(64,)
+- fusion_ffn.dense_1.weight: shape=(256, 64)
+- fusion_ffn.dense_1.bias: shape=(256,)
+- fusion_ffn.dense_2.weight: shape=(64, 256)
+- fusion_ffn.dense_2.bias: shape=(64,)
+- fusion_ffn.LayerNorm.weight: shape=(64,)
+- fusion_ffn.LayerNorm.bias: shape=(64,)
+- fusion_position_embedding.weight: shape=(10, 64)
+总参数量: 928448, 可训练参数量: 50624
+
+[Check] Attention关键参数可训练标记：
+  seq_tar_fusion.query.weight: requires_grad=True, shape=(64, 64)
+  seq_tar_fusion.query.bias: requires_grad=True, shape=(64,)
+  seq_tar_fusion.key.weight: requires_grad=True, shape=(64, 64)
+  seq_tar_fusion.key.bias: requires_grad=True, shape=(64,)
+  seq_tar_fusion.value.weight: requires_grad=True, shape=(64, 64)
+  seq_tar_fusion.value.bias: requires_grad=True, shape=(64,)
+
+\end{verbatim}
+
 \section{融合索引后性能和KL散度对齐效果（核心问题）}
 
-本次实验基于TTARArec模型，通过检索增强技术提升序列推荐性能。实验中实现了三个关键的索引一致性指标来分析检索增强机制的有效性：
+核心思想是让推荐损失给v矩阵传递信号，kl散度给qk传递信号，kl散度损失告诉attention层选什么索引，推荐损失告诉attention层如何用好选择的索引
 
-\begin{enumerate}
-    \item Top-1选择一致性：检索评分最高索引与注意力评分最高索引的一致性
-    \item 最佳增强效果索引一致性：实际最有效的增强索引与表征相似度最高索引的一致性
-    \item 融合权重最高索引一致性：交叉注意力融合时权重最高索引与表征相似度最高索引的一致性
-\end{enumerate}
 
-\subsection{关键数据}
-
-在第33个batch的训练过程中，观察到以下关键指标：
-
+% 跨数据集模型对比（Recall）
+\subsection{模型性能对比（Recall / NDCG）}
+% Beauty 表
 \begin{table}[H]
 \centering
-\caption{实验关键指标}
-\begin{tabular}{@{}lr@{}}
+\caption{Beauty：DuoRec / RaSeRec / TTARArec（recall@5 / recall@50 / ndcg@5 / ndcg@50）}
+\begin{tabular}{lcccc}
 \toprule
-指标 & 数值 \\
 \midrule
-Top-1选择一致性 & 14.62\% \\
-最佳增强效果索引与表征相似度最高索引一致性 & 15.58\% \\
-融合权重最高索引与表征相似度最高索引一致性 & 29.22\% \\
-\midrule
-原始序列与增强序列相似度 & 0.966132 \\
-原始序列与目标项相似度 & 4.225115 \\
-增强序列与目标项相似度 & 4.302148 \\
-增强带来的相似度提升 & 0.077033 \\
-\midrule
-最佳检索序列拼接后相似度 & 4.891777 \\
-检索器潜在提升空间 & 0.666662 \\
-融合机制利用率 & 11.56\% \\
+Dataset & \multicolumn{4}{c}{Beauty} \\
+指标 & recall@5 & recall@50 & ndcg@5 & ndcg@50 \\
+DuoRec & 0.0537 & 0.1766 & 0.0342 & 0.0637 \\
+RaSeRec & 0.0566 & 0.1794 & 0.0358 & 0.0653 \\
+TTARArec & 0.0566 & 0.1832 & 0.0362 & 0.0665 \\
+TTARArec较DuoRec提升（\%） & 5.40\% & 3.74\% & 5.85\% & 4.39\% \\
 \bottomrule
 \end{tabular}
-\label{tab:debug_results}
+\label{tab:beauty_compare_metrics}
 \end{table}
 
-\subsection{主要发现}
+% Sport 表
+\begin{table}[H]
+\centering
+\caption{Sport：DuoRec / RaSeRec / TTARArec（recall@5 / recall@50 / ndcg@5 / ndcg@50）}
+\begin{tabular}{lcccc}
+\toprule
+\midrule
+Dataset & \multicolumn{4}{c}{Sport} \\
+指标 & recall@5 & recall@50 & ndcg@5 & ndcg@50 \\
+DuoRec & 0.0305 & 0.1094 & 0.0189 & 0.0377 \\
+RaSeRec & 0.0319 & 0.1116 & 0.0196 & 0.0385 \\
+TTARArec & 0.0327 & 0.1148 & 0.0200 & 0.0394 \\
+TTARArec较DuoRec提升（\%） & 7.21\% & 4.94\% & 5.82\% & 4.51\% \\
+\bottomrule
+\end{tabular}
+\label{tab:sport_compare_metrics}
+\end{table}
 
-\subsubsection{表征相似度与实际效果不一致}
-最佳增强效果索引与表征相似度最高索引的一致性仅为15.58\%，说明表征相似度高的检索结果并不一定带来最好的推荐效果。
+% KL权重对Top-30排序影响
+\begin{table}[H]
+\centering
+\caption{KL散度设为0和0.8前后模型对target排序（随机采样3组Top-30）}
+\scriptsize
+\begin{tabular}{c c p{0.78\textwidth}}
+\toprule
+\textbf{Sample} & \textbf{KL} & \textbf{Top-30 items} \\
+\midrule
+\multirow{2}{*}{88} & 0.0 & [12064, 11996, 11678, 11422, 12014, 12032, 11743, 11919, 12075, 12043, 11260, 12000, 12074, 11936, 12047, 11873, 11689, 12071, 11890, 12089, 12052, 12035, 12015, 12072, 11833, 12081, 12092, 11958, 11959, 12060] \\
+ & 0.8 & [12064, 11996, 11678, 11422, 12032, 12014, 11919, 11743, 12043, 11260, 12075, 11936, 12074, 12047, 12000, 11833, 12089, 11873, 11689, 12072, 12071, 11719, 12081, 12002, 11890, 12035, 12052, 12015, 12092, 11958] \\
+\multirow{2}{*}{89} & 0.0 & [12078, 12088, 12080, 12079, 11988, 12022, 11662, 12059, 11909, 12027, 12050, 12077, 12041, 11658, 11990, 12065, 12066, 11970, 12086, 12057, 12058, 12090, 12038, 11976, 12040, 12054, 11686, 11228, 11740, 11814] \\
+ & 0.8 & [12088, 12079, 12080, 12078, 11662, 11988, 12022, 12059, 12027, 11909, 11658, 12065, 12077, 12050, 11990, 12066, 12041, 11970, 12086, 12058, 12057, 12090, 11976, 12040, 11740, 11686, 11228, 12054, 11791, 11045] \\
+\multirow{2}{*}{90} & 0.0 & [12079, 12078, 11988, 11662, 12080, 12088, 12059, 12022, 11990, 12077, 12066, 12041, 11909, 11658, 12027, 12065, 12040, 12050, 11970, 11919, 12086, 12055, 12058, 12038, 11604, 12090, 11814, 11719, 12057, 11617] \\
+ & 0.8 & [12079, 12078, 11988, 11662, 12088, 12080, 12059, 12022, 11990, 12077, 12066, 11658, 12027, 12065, 11909, 12040, 12041, 11970, 12050, 12055, 11919, 12086, 12058, 11719, 12090, 11832, 11045, 11604, 11814, 12038] \\
+\bottomrule
+\end{tabular}
+\label{tab:kl_top30_compare}
+\end{table}
 
-\subsubsection{融合模块学习偏向问题}
-融合权重最高索引与表征相似度最高索引的一致性为29.22\%，明显高于实际效果一致性，表明融合模块更倾向于关注表征相似度高的索引。
+% 去除推荐损失中目标向量 requires_grad_(True) 的影响
+\begin{table}[H]
+\centering
+\caption{去除推荐损失计算中目标向量的.requires\_grad\_(True) 前后对比（recall@5 / recall@50 / ndcg@5 / ndcg@50）}
+\begin{tabular}{lcccc}
+\toprule
+设置 & recall@5 & recall@50 & ndcg@5 & ndcg@50 \\
+\midrule
+去除gradient & 0.0547 & 0.1784 & 0.0356 & 0.0655 \\
+未去除 & 0.0554 & 0.1818 & 0.0358 & 0.0662 \\
+\bottomrule
+\end{tabular}
+\label{tab:grad_freeze_compare}
+\end{table}
 
-\subsubsection{融合机制利用率低}
-融合机制利用率仅为11.56\%，远低于理论潜在提升空间（0.666662），说明融合机制没有充分利用检索到的有用信息。
+% 新增：KL散度量纲说明
+\subsection{kl散度量纲}
+\paragraph{初始损失组成（示例）}
+\begin{itemize}
+    \item 推荐损失: 6.841918
+    \item KL散度损失: 0.483760
+    \item 总损失: 1.755392
+\end{itemize}
 
-\subsection{结论}
-实验结果表明，当前基于表征相似度的检索策略与实际推荐效果之间存在根本性不一致。相似性和有用性之间存在显著差距，这是检索增强推荐系统中需要解决的核心问题。
-
-\section{Attention层结构优化}
-
-\subsection{Value矩阵训练问题}
-% 待填充：关于attention层结构中没有训练value矩阵的实验结果
-
-\subsection{推荐损失监督信号}
-% 待填充：推荐损失提供监督信号的实验结果
-
-\section{检索评分机制改进}
-
-\subsection{MLP层必要性验证}
-% 待填充：检索评分是否有必要加上mlp层的实验结果
-
-\subsection{检索任务适应性}
-% 待填充：适应检索任务的实验结果
-
-\section{Attention结构与位置编码}
-
-\subsection{Attention结构设计}
-% 待填充：attention结构以及应用位置编码的实验结果
-
-\subsection{模型性能影响}
-% 待填充：模型性能没提升的分析
-
-\section{损失函数权重调整}
-
-\subsection{推荐损失权重设置}
-% 待填充：推荐损失权重设置为1的实验结果
-
-\subsection{KL散度问题分析}
-% 待填充：kl散度太大的问题分析，包括索引数量k值影响、batchsize影响、dropout影响
-
-\section{融合机制改进}
-
-\subsection{序列融合方式}
-% 待填充：融合改为序列的实验结果
-
-\subsection{知识库构建方式修改}
-% 待填充：修改知识库构建方式的实验结果，提升不明显的分析
-
-\subsection{性能提升效果}
-% 待填充：模型性能没提升的分析
-
-\section{参数数量调整}
-
-\subsection{注意力头数(head)调整}
-% 待填充：注意力头数调整的实验结果
-
-\subsection{MLP层参数(mlp)调整}
-% 待填充：MLP层参数调整的实验结果
-
-\subsection{内部维度(inner_size)调整}
-% 待填充：内部维度调整的实验结果
-
-\section{超参数调优}
-
-\subsection{基础训练参数}
-% 待填充：learning_rate、train_batch_size调优结果
-
-\subsection{检索相关参数}
-% 待填充：nprobe调优结果
-
-\subsection{正则化参数}
-% 待填充：dropout调优结果
-
-\subsection{温度和注意力参数}
-% 待填充：temperature、attn_tau调优结果
-
-\subsection{损失函数权重参数}
-% 待填充：kl_loss_weight、fusion_weight调优结果
-
+\paragraph{量纲与计算说明}
+\begin{itemize}
+    \item KL散度与交叉熵均为\textbf{无量纲}（信息量，常以\emph{nats}表示），因此可以线性加权相加。数值尺度与类别数/候选数有关：例如 K=10 时，$\ln K\approx2.303$。
+    \item 本实现中使用 \texttt{F.kl\_div(log\_attention\_probs, teacher\_probs, reduction='batchmean')}：对类别维（K）\textbf{求和}后，再对 batch 维\textbf{取均值}，得到标量 KL 损失。
+    \item 推荐损失（全排序交叉熵）的典型初始量级约为 $\mathcal{O}(\ln N)$（N为物品数），KL 的量级约为 $\mathcal{O}(\ln K)$，两者通过权重进行平衡。
+    \item 推荐损失（交叉熵损失CE）：先计算全物品相似度，然后再 softmax 得到每个物品概率，最后拿正样本概率做 $-\log p(i, y_i)$ 得到该样本损失，最后平均 batch，6.7 的平均损失说明在全库上正样本概率在 0.0011 左右
+    \item KL 散度损失：先 $qk/\sqrt{k}$ 做 softmax 得到融合概率，然后将索引融合编码得到的表征做相似度得到 logits 后 softmax 得到概率，将两个概率做 KL 散度计算得到损失，理论上限是 $\ln(k)$。
+    \item 回合损失：KL 损失和推荐损失加权和，再乘 batch 的数量
+  \end{itemize}
+\section{实验结果记录}
 \end{CJK}
 \end{document}
 

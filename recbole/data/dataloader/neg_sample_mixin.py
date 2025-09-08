@@ -96,7 +96,7 @@ class NegSampleByMixin(NegSampleMixin):
     """
 
     def __init__(
-        self, config, dataset, sampler, neg_sample_args, batch_size=1, dl_format=InputType.POINTWISE, shuffle=False
+        self, config, dataset, sampler, neg_sample_args, batch_size=1, dl_format=InputType.POINTWISE, shuffle=False, phase='train'
     ):
         if neg_sample_args['strategy'] != 'by':
             raise ValueError('neg_sample strategy in GeneralInteractionBasedDataLoader() should be `by`')
@@ -126,7 +126,7 @@ class NegSampleByMixin(NegSampleMixin):
             raise ValueError(f'`neg sampling by` with dl_format [{dl_format}] not been implemented.')
 
         super().__init__(
-            config, dataset, sampler, neg_sample_args, batch_size=batch_size, dl_format=dl_format, shuffle=shuffle
+            config, dataset, sampler, neg_sample_args, batch_size=batch_size, dl_format=dl_format, shuffle=shuffle, phase=phase
         )
 
     def _neg_sample_by_pair_wise_sampling(self, *args):

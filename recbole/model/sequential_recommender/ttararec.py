@@ -25,6 +25,7 @@ from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import activation_layer, CrossMultiHeadAttention, FeedForward
 from recbole.model.sequential_recommender.pretrained_model_loader import PretrainedModelLoader
 import torch.nn.functional as F
+from recbole.utils.ttararec_diagnostics import compute_retrieval_effectiveness_vectorized, print_diagnostic_info_optimized, get_attention_grad_norms
 
 
 class TTARArec(SequentialRecommender):
@@ -43,11 +44,23 @@ class TTARArec(SequentialRecommender):
 
         # ========== 1. 加载预训练模型 ==========
         self.pretrained_model = PretrainedModelLoader.load_duorec_model(config, dataset)
+        self.pretrained_model.requires_grad_(False)
         
         # ========== 2. 从预训练模型获取基础架构参数 ==========
         self.hidden_size = self.pretrained_model.hidden_size
         self.hidden_act = getattr(self.pretrained_model, 'hidden_act', config['hidden_act'] if 'hidden_act' in config else 'gelu')
         self.initializer_range = config['initializer_range']
+        # 损失类型（CE 或 BPR）
+        self.loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
+        self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
+        # BPR硬负采样配置
+        self.bpr_num_negatives = config['bpr_num_negatives'] if 'bpr_num_negatives' in config else 1
+        self.bpr_hard_negatives = config['bpr_hard_negatives'] if 'bpr_hard_negatives' in config else False
+        # 定义损失函数
+        if self.loss_type == 'BPR':
+            self.loss_fct = BPRLoss()
+        else:
+            self.loss_fct = nn.CrossEntropyLoss()
 
         # ========== 3. 设置检索相关参数 ==========
         # 检索配置参数
@@ -59,16 +72,19 @@ class TTARArec(SequentialRecommender):
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
+        # 检索评分负信号配置
+        self.retrieval_num_negatives = config['retrieval_num_negatives'] if 'retrieval_num_negatives' in config else 3
 
         # ========== 4. 设置训练相关参数 ==========
-        # 温度系数和损失权重
-        self.retriever_temperature = config['retriever_temperature'] if 'retriever_temperature' in config else 0.1
-        self.recommendation_temperature = config['recommendation_temperature'] if 'recommendation_temperature' in config else 0.1
+        # 损失权重
         
         # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
         self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
 
+        # 测试阶段输出Top-K推荐结果控制（仅最终测试使用）
+        self.final_test_mode = False
+        self.final_test_topk = 30
         # ========== 5. 构建检索器和融合组件 ==========
         self._build_retrieval_components(config)
 
@@ -80,6 +96,7 @@ class TTARArec(SequentialRecommender):
         self.seq_emb_knowledge = None
         self.item_seq_knowledge = None  # 原始交互序列知识库
         self.tar_emb_knowledge = None
+        self.tar_item_knowledge = None  # 目标物品ID知识库
         self.seq_emb_index = None
         self.tar_emb_index = None
         
@@ -89,8 +106,8 @@ class TTARArec(SequentialRecommender):
     def _build_retrieval_components(self, config):
         """构建检索器MLP层和交叉注意力融合组件"""
         # 检索器编码器相关参数
-        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 1
-        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0.1
+        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 0
+        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0
                 
         # 激活函数和dropout
         self.retriever_act_fn = activation_layer(self.hidden_act)
@@ -109,20 +126,19 @@ class TTARArec(SequentialRecommender):
             )
 
         # 交叉注意力融合机制参数（独立于预训练模型参数）
-        self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 2
+        self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 1
         self.fusion_inner_size = config['fusion_inner_size'] if 'fusion_inner_size' in config else 256
-        self.fusion_dropout_prob = config['fusion_dropout_prob'] if 'fusion_dropout_prob' in config else 0.1
+        self.fusion_dropout_prob = config['fusion_dropout_prob'] if 'fusion_dropout_prob' in config else 0
         self.fusion_layer_norm_eps = config['fusion_layer_norm_eps'] if 'fusion_layer_norm_eps' in config else 1e-12
-        self.attn_tau = config['attn_tau'] if 'attn_tau' in config else 0.2  # 注意力温度系数
         
-        # 交叉注意力融合机制组件
-        self.seq_tar_fusion = CrossMultiHeadAttention(
-            n_heads=self.fusion_n_heads,
-            hidden_size=self.hidden_size,
-            hidden_dropout_prob=self.fusion_dropout_prob,
-            attn_dropout_prob=self.fusion_dropout_prob,
-            layer_norm_eps=self.fusion_layer_norm_eps,
-            attn_tau=self.attn_tau
+        # 交叉注意力融合机制组件（使用PyTorch MultiheadAttention）
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=self.fusion_n_heads,
+            dropout=self.fusion_dropout_prob,
+            batch_first=True,
+            kdim=self.hidden_size,
+            vdim=self.hidden_size
         )
         
         self.fusion_ffn = FeedForward(self.hidden_size, self.fusion_inner_size, self.fusion_dropout_prob, self.hidden_act, self.fusion_layer_norm_eps)
@@ -141,7 +157,7 @@ class TTARArec(SequentialRecommender):
             self._init_weights(layer_norm)
         
         # 初始化交叉注意力融合机制
-        self.seq_tar_fusion.apply(self._init_weights)
+        # PyTorch MultiheadAttention 已内置初始化
         self.fusion_ffn.apply(self._init_weights)
         self.fusion_position_embedding.apply(self._init_weights)
 
@@ -184,30 +200,25 @@ class TTARArec(SequentialRecommender):
         
         return hidden
     
-    def fusion_forward(self, seq_output, retrieved_seqs, retrieved_tars):
-        """交叉注意力融合机制前向传播"""
-        # 交叉注意力融合：query是当前序列，key是检索序列表征，value是目标嵌入
-        seq_output_expanded = seq_output.unsqueeze(1)  # [B, 1, H]
-        
-        # 使用交叉注意力层：query=当前序列，key=检索序列表征，value=目标嵌入
-        fused_output = self.seq_tar_fusion(
-            seq_output_expanded,        # input_query: [B, 1, H]
-            retrieved_seqs,            # input_key: [B, K, H] 
-            retrieved_tars             # input_value: [B, K, H]
-        )  # fused_output: [B, 1, H]
-        
+    def fusion_forward(self, seq_output, key_sequences, value_sequences=None):
+        """交叉注意力融合机制前向传播（使用nn.MultiheadAttention）"""
+        if value_sequences is None:
+            value_sequences = key_sequences
+        # 形状：[B, 1, H] 与 [B, K, H]
+        query = seq_output.unsqueeze(1)
+        key = key_sequences
+        value = value_sequences
+        # nn.MultiheadAttention expects (B, L, H) with batch_first=True
+        fused_output, attn_weights = self.cross_attn(query, key, value, need_weights=True)
         fused_output = fused_output.squeeze(1)  # [B, H]
-        
-        # 前馈神经网络进一步处理
-        fused_output = self.fusion_ffn(fused_output)  # [B, H]
-        
+        fused_output = self.fusion_ffn(fused_output)
         return fused_output
 
     def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
-        """检索相似序列和对应的目标嵌入以及原始交互序列"""
+        """检索相似序列和对应的目标物品ID以及原始交互序列（基于q检索）"""
         queries_cpu = queries.detach().cpu().numpy()
         normalize_L2(queries_cpu)
-        _, I1 = self.seq_emb_index.search(queries_cpu, 4*topk)
+        _, I1 = self.seq_emb_index.search(queries_cpu, 4 * topk)
         
         # 过滤掉同用户的相同长度序列
         I1_filtered = []
@@ -223,156 +234,126 @@ class TTARArec(SequentialRecommender):
         
         I1_filtered = np.array(I1_filtered)
         
-        # 获取检索结果 - 三项内容：序列表征、原始交互序列、目标嵌入
+        # 获取检索结果 - 三项内容：序列表征、原始交互序列、目标物品ID
         retrieval_seqs = self.seq_emb_knowledge[I1_filtered]  # 序列表征
         retrieval_item_seqs = self.item_seq_knowledge[I1_filtered]  # 原始交互序列
-        retrieval_tars = self.tar_emb_knowledge[I1_filtered]  # 目标嵌入
+        retrieval_tar_items = self.tar_item_knowledge[I1_filtered]  # 目标物品ID
         
         return (
             torch.tensor(retrieval_seqs).to("cuda"), 
-            torch.tensor(retrieval_item_seqs).to("cuda"),  # 增加返回原始交互序列
-            torch.tensor(retrieval_tars ).to("cuda"), 
-
+            torch.tensor(retrieval_item_seqs).to("cuda"),  # 原始交互序列
+            torch.tensor(retrieval_tar_items).to("cuda"),  # 目标物品ID
         )   
-
     # ============ 损失计算相关方法 ============
 
-    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len):
-        """计算检索评分 - 基于原始序列拼接和重新编码的相似度"""
-        batch_size, n_retrieved, _ = retrieved_tars.size()
-        pos_items_emb = self.get_item_embedding(pos_items)  # [batch_size, hidden_size]
-        
-        fusion_scores = []
-        
-        # 对每个检索到的原始序列进行处理
-        for i in range(n_retrieved):
-            batch_new_seqs = []
-            batch_new_seq_lens = []
-            
-            # 批量处理所有样本 - 大幅优化内层循环
-            
-            # 预分配结果张量
-            max_seq_len = item_seq.size(1)
-            batch_new_seqs = torch.zeros(batch_size, max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
-            batch_new_seq_lens = torch.zeros(batch_size, dtype=torch.long, device=item_seq.device)
-            
-            # 批量计算检索序列的有效长度
-            retrieved_seqs_i = retrieved_item_seqs[:, i, :]  # [batch_size, max_seq_len]
-            
-            # 使用向量化操作找到有效长度
-            nonzero_masks = (retrieved_seqs_i != 0)  # [batch_size, max_seq_len]
-            # 找到每行最后一个非零位置
-            seq_lens = torch.sum(nonzero_masks, dim=1)  # [batch_size] 直接计算非零元素数量
-            
-            # 完全向量化处理 - 真正消除batch_size循环！
-            current_seq_lens = torch.from_numpy(batch_seq_len).to(item_seq.device)
-            
-            # 方法：使用gather和scatter操作进行向量化拼接
-            # 1. 计算新序列长度
-            total_lens = current_seq_lens + seq_lens
-            new_seq_lens = torch.clamp(total_lens, max=max_seq_len)
-            
-            # 2. 创建一个大的拼接张量 [batch_size, 2*max_seq_len]
-            # 前半部分放原序列，后半部分放检索序列
-            concat_seqs = torch.zeros(batch_size, 2 * max_seq_len, dtype=item_seq.dtype, device=item_seq.device)
-            concat_seqs[:, :max_seq_len] = item_seq
-            concat_seqs[:, max_seq_len:] = retrieved_seqs_i
-            
-            # 3. 为每个样本创建索引，从concat_seqs中选择正确的元素
-            batch_indices = torch.arange(batch_size, device=item_seq.device).unsqueeze(1)
-            
-            # 4. 创建序列索引：对于每个位置，决定从原序列还是检索序列取值
-            position_indices = torch.arange(max_seq_len, device=item_seq.device).unsqueeze(0).expand(batch_size, -1)
-            
-            # 原序列部分的掩码
-            current_mask = position_indices < current_seq_lens.unsqueeze(1)
-            # 检索序列部分的掩码（从原序列长度开始）
-            retrieved_start_pos = current_seq_lens.unsqueeze(1)
-            retrieved_mask = (position_indices >= retrieved_start_pos) & (position_indices < new_seq_lens.unsqueeze(1))
-            
-            # 5. 构建最终序列
-            batch_new_seqs = torch.zeros_like(item_seq)
-            
-            # 复制原序列
-            batch_new_seqs[current_mask] = item_seq[current_mask]
-            
-            # 添加检索序列（需要计算正确的检索序列位置）
-            if retrieved_mask.any():
-                # 计算检索序列中的相对位置
-                retrieved_relative_pos = position_indices - retrieved_start_pos
-                retrieved_relative_pos = torch.clamp(retrieved_relative_pos, min=0, max=max_seq_len-1)
-                
-                # 从检索序列中获取正确的值
-                retrieved_values = retrieved_seqs_i[batch_indices.expand(-1, max_seq_len), retrieved_relative_pos]
-                batch_new_seqs[retrieved_mask] = retrieved_values[retrieved_mask]
-            
-            batch_new_seq_lens = new_seq_lens
-            
-            # 使用DuoRec编码器重新编码新序列
-            new_seq_output = self.forward(batch_new_seqs, batch_new_seq_lens)  # [batch_size, hidden_size]
-            
-            # 从DuoRec输出中分离梯度，然后重新启用梯度用于检索器MLP训练
-            new_seq_output = new_seq_output.detach().requires_grad_(True)
-            
-            # 使用检索器MLP进一步处理序列表征
-            enhanced_seq_output = self.retriever_forward(new_seq_output)  # [batch_size, hidden_size]
-            
-            # 计算增强后序列表征与真实下一项的相似度
-            similarity_score = torch.sum(enhanced_seq_output * pos_items_emb, dim=-1)  # [batch_size]
-            fusion_scores.append(similarity_score)
-        
-        # 将所有检索结果的相似度堆叠
-        stacked_scores = torch.stack(fusion_scores, dim=1)  # [batch_size, n_retrieved]
-        
-        # 应用温度缩放并转换为概率分布
-        retrieval_logits = stacked_scores / self.retriever_temperature
-        retrieval_probs = torch.softmax(retrieval_logits, dim=1)
-        
-        return retrieval_probs  # [batch_size, n_retrieved]
 
-    def compute_attention_scores(self, seq_output, retrieved_seqs, retrieved_tars):
-        """计算注意力评分 - 直接计算注意力权重"""
-        # 扩展当前序列输出用于注意力计算
-        seq_output_expanded = seq_output.unsqueeze(1)  # [B, 1, H]
+
+    def compute_enhanced_sequences(self, retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output):
+        """计算增强序列表征 - 将检索到的目标物品ID拼接到原始序列末尾（完全GPU向量化）"""
+        batch_size, n_retrieved = retrieved_tar_items.size()
+        max_seq_len = item_seq.size(1)
         
-        # 手动计算交叉注意力权重（不使用value，只计算query与key的注意力）
-        mixed_query_layer = self.seq_tar_fusion.query(seq_output_expanded)  # [B, 1, H]
-        mixed_key_layer = self.seq_tar_fusion.key(retrieved_seqs)  # [B, K, H]
+        # 将batch_seq_len转换为GPU张量
+        current_seq_lens = torch.from_numpy(batch_seq_len).to(item_seq.device)
         
-        # 转换为多头形状
-        query_layer = self.seq_tar_fusion.transpose_for_scores(mixed_query_layer)  # [B, n_heads, 1, head_size]
-        key_layer = self.seq_tar_fusion.transpose_for_scores(mixed_key_layer)  # [B, n_heads, K, head_size]
+        # 批量处理所有检索结果，避免循环
+        # 扩展原始序列以匹配检索数量 [B, K, max_seq_len]
+        item_seq_expanded = item_seq.unsqueeze(1).expand(-1, n_retrieved, -1)
+        enhanced_seqs = item_seq_expanded.clone()  # [B, K, max_seq_len]
         
-        # 计算注意力得分
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))  # [B, n_heads, 1, K]
-        attention_scores = attention_scores / math.sqrt(self.seq_tar_fusion.attention_head_size)
+        # 计算新序列长度（原序列长度 + 1个目标物品）
+        new_seq_lens = torch.clamp(current_seq_lens + 1, max=max_seq_len)  # [B]
+        new_seq_lens_expanded = new_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
         
-        # 平均所有注意力头的得分
-        attention_scores = attention_scores.mean(dim=1)  # [B, 1, K]
-        attention_scores = attention_scores.squeeze(1)  # [B, K]
+        # 向量化添加目标物品到序列末尾
+        batch_indices = torch.arange(batch_size, device=item_seq.device).unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
+        retrieve_indices = torch.arange(n_retrieved, device=item_seq.device).unsqueeze(0).expand(batch_size, -1)  # [B, K]
         
-        # 使用温度缩放
-        attention_probs = torch.softmax(attention_scores / self.recommendation_temperature, dim=-1)
+        # 创建掩码：只在序列长度小于max_seq_len时添加目标物品
+        valid_append_mask = current_seq_lens.unsqueeze(1) < max_seq_len  # [B, 1]
         
-        return attention_probs
+        # 使用高级索引批量设置目标物品
+        if valid_append_mask.any():
+            # 获取可以添加目标物品的位置
+            append_positions = current_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
+            
+            # 创建索引张量来批量设置值
+            valid_positions = append_positions < max_seq_len
+            if valid_positions.any():
+                # 使用scatter_方法批量设置目标物品
+                batch_idx_flat = batch_indices[valid_positions]
+                retrieve_idx_flat = retrieve_indices[valid_positions]
+                position_flat = append_positions[valid_positions]
+                target_items_flat = retrieved_tar_items[batch_idx_flat, retrieve_idx_flat]
+                
+                enhanced_seqs[batch_idx_flat, retrieve_idx_flat, position_flat] = target_items_flat
+        
+        # 批量重新编码所有增强序列
+        # 将[B, K, max_seq_len]重塑为[B*K, max_seq_len]进行批量编码
+        enhanced_seqs_flat = enhanced_seqs.reshape(batch_size * n_retrieved, max_seq_len)
+        new_seq_lens_flat = new_seq_lens_expanded.reshape(batch_size * n_retrieved)
+        
+        # 批量编码
+        enhanced_outputs_flat = self.forward(enhanced_seqs_flat, new_seq_lens_flat)  # [B*K, hidden_size]
+        
+        # 重塑回[B, K, hidden_size]
+        enhanced_sequences = enhanced_outputs_flat.reshape(batch_size, n_retrieved, -1)
+        
+        return enhanced_sequences
+
+    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None, query_output=None, neg_items=None):
+        batch_size = pos_items.size(0)
+        n_retrieved = enhanced_sequences.size(1) 
+        pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
+        all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
+
+        if enhanced_sequences is not None:
+            # 按逐序列BPR损失对齐
+            if neg_items is not None:
+                # 正项分数 [B, K]
+                pos_scores_k = torch.sum(enhanced_sequences * pos_items_emb.unsqueeze(1), dim=-1)
+                # 负项分数
+                neg_items_emb = self.get_item_embedding(neg_items)  # [B,H] 或 [B,n_neg,H]
+                if neg_items_emb.dim() == 2:
+                    # 单负样本：为每个增强序列重复该负样本
+                    neg_scores_k = torch.sum(enhanced_sequences * neg_items_emb.unsqueeze(1), dim=-1)  # [B,K]
+                    bpr_k = F.softplus(-(pos_scores_k - neg_scores_k))  # [B,K]
+                else:
+                    # 多负样本：对每个增强序列与所有负样本逐对计算，再对负样本求均值
+                    # neg_items_emb: [B,n_neg,H] -> [B,1,n_neg,H]
+                    neg_scores_all = torch.sum(
+                        enhanced_sequences.unsqueeze(2) * neg_items_emb.unsqueeze(1), dim=-1
+                    )  # [B,K,n_neg]
+                    bpr_k = F.softplus(-(pos_scores_k.unsqueeze(2) - neg_scores_all)).mean(dim=2)  # [B,K]
+                logits = -bpr_k  # 损失越小越好
+                tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1
+        return torch.softmax(logits / max(tau, 1e-6), dim=1).detach()
+
+    def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
+        """计算注意力评分 - 使用nn.MultiheadAttention提取注意力权重"""
+        if enhanced_sequences is not None:
+            key_sequences = enhanced_sequences
+            value_sequences = enhanced_sequences
+        query = seq_output.unsqueeze(1)  # [B, 1, H]
+        # 通过cross_attn拿到注意力权重
+        _, attn_weights = self.cross_attn(query, key_sequences, value_sequences, need_weights=True, average_attn_weights=False)
+        # attn_weights: [B, num_heads, Lq=1, K]
+        attn_weights = attn_weights.squeeze(2).mean(dim=1)  # [B, K]
+        return attn_weights
 
     def compute_kl_loss(self, attention_probs, retrieval_probs):
-        """计算注意力分布与检索分布之间的KL散度损失"""
+        """计算注意力分布与检索分布之间的KL散度损失 - 使用PyTorch库函数"""
         # 确保两个分布的维度完全匹配
         assert attention_probs.shape == retrieval_probs.shape, \
             f"形状不匹配: attention_probs {attention_probs.shape} vs retrieval_probs {retrieval_probs.shape}"
         
-        # 避免数值问题
-        epsilon = 1e-8
-        attention_probs = attention_probs + epsilon
-        retrieval_probs = retrieval_probs + epsilon
+        # 使用PyTorch的kl_div函数，更数值稳定
+        # kl_div接受log概率作为第一个参数，目标分布作为第二个参数
+        # KL(attention_probs || retrieval_probs)
+        log_retrieval_probs = torch.log(retrieval_probs + 1e-8)
+        kl_div = F.kl_div(log_retrieval_probs, attention_probs, reduction='batchmean')
         
-        # KL散度计算: KL(attention_probs || retrieval_probs)
-        # 优化注意力分布使其接近检索分布
-        kl_div = torch.sum(attention_probs * torch.log(attention_probs / retrieval_probs), dim=-1)
-        
-        # 返回批次平均损失
-        return kl_div.mean()
+        return kl_div
 
     def calculate_loss(self, interaction):
         """计算训练损失 - KL散度损失 + 推荐损失"""
@@ -384,46 +365,113 @@ class TTARArec(SequentialRecommender):
         batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
         batch_seq_len = item_seq_len.detach().cpu().numpy()        
 
-        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
-            
-        # 计算推荐损失
-        test_item_emb = self.pretrained_model.item_embedding.weight.requires_grad_(True)
-        logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
-        rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
-
-        
-        # 检索相似序列和目标嵌入
-        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
+        # 检索相似序列和目标物品ID
+        retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
             seq_output,
             batch_user_id, 
             batch_seq_len,
             topk=self.topk
         )
 
-        # 计算检索评分：基于原始序列拼接和重新编码的相似度
+        # 一次性计算增强序列表征，供后续复用
+        enhanced_sequences = self.compute_enhanced_sequences(
+            retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
+        )
+
+        # 使用预计算的增强序列表征进行序列增强
+        seq_output_aug = self.seq_augmented(
+            seq_output, batch_user_id, batch_seq_len, 
+            enhanced_sequences=enhanced_sequences
+        )
+            
+        # 计算推荐损失（支持CE/BPR）
+        if self.loss_type == 'BPR':
+            # 标准BPR：统一使用 RecBole 的 BPRLoss；
+            # 负样本来源：
+            # - 优先从数据管线 interaction 读取 NEG_ITEM_ID（推荐）
+            # - 可选启用硬负采样，仅用于“选负样本”，损失依旧走 BPRLoss
+            pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
+            if getattr(self, 'bpr_hard_negatives', False):
+                # 硬负样本选择
+                all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
+                scores_full = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]
+                batch_idx = torch.arange(scores_full.size(0), device=scores_full.device)
+                scores_full[batch_idx, pos_items] = -1e9  # 屏蔽正样本
+                k = int(getattr(self, 'bpr_num_negatives', 1))
+                k = max(1, min(k, scores_full.size(1) - 1))
+                _, neg_idx = torch.topk(scores_full, k=k, dim=1, largest=True)  # [B, K]
+                neg_items_emb = all_items_emb[neg_idx]  # [B, K, H]
+                # 分数
+                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
+                neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, K]
+                # 展平为标准 BPRLoss 输入
+                rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
+            else:
+                # 管线负采样（标准做法）
+                neg_items = interaction[self.NEG_ITEM_ID]
+                neg_items_emb = self.get_item_embedding(neg_items)  # [B, H] 或 [B, n_neg, H]
+                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
+                if neg_items_emb.dim() == 2:
+                    neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
+                    rec_loss = self.loss_fct(pos_score, neg_score)
+                else:
+                    neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, n_neg]
+                    rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
+        else:
+            # 默认回退CE
+            test_item_emb = self.pretrained_model.item_embedding.weight
+            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
+            rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
+
+        # 计算检索评分：使用预计算的增强序列表征
+        neg_items_for_ret = interaction[self.NEG_ITEM_ID]
         retrieval_probs = self.compute_retrieval_scores(
-            retrieved_item_seqs, retrieved_tars, pos_items, item_seq, item_seq_len, batch_seq_len
+            retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
+            enhanced_sequences=enhanced_sequences, query_output=seq_output_aug, neg_items=neg_items_for_ret
         )  # [B, K]
         
-        # 计算注意力评分：基于交叉注意力权重
+        # 计算注意力评分：使用增强序列表征
         attention_probs = self.compute_attention_scores(
-            seq_output, retrieved_seqs, retrieved_tars
+            seq_output, None, None, enhanced_sequences=enhanced_sequences
         )  # [B, K]
         
         # 计算KL散度损失（注意力评分向检索评分对齐）
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
+
+        # ============ 诊断信息输出 ============
+        # 每33个batch输出一次诊断信息
+        if hasattr(self, 'batch_count'):
+            self.batch_count += 1
+        else:
+            self.batch_count = 0
+            
+        if self.batch_count % 129 == 0:
+            # 计算检索效果指标
+            retrieval_effectiveness, augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency = compute_retrieval_effectiveness_vectorized(self,
+                retrieved_item_seqs, pos_items, item_seq, item_seq_len, batch_seq_len, retrieved_seqs, retrieved_tar_items, enhanced_sequences
+            )
+            
+            print_diagnostic_info_optimized(self,
+                rec_loss, kl_loss, retrieval_probs, attention_probs, 
+                seq_output, seq_output_aug, pos_items, retrieval_effectiveness, 
+                augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency,
+            )
         
         # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
-        total_loss = kl_loss * self.kl_loss_weight + rec_loss * (1-self.kl_loss_weight)
+        total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         
         return total_loss
+
+
+
+
 
     # ============ 知识库构建相关方法 ============
     
     def precached_knowledge(self):
         """预缓存知识库 - 构建检索索引"""
         print("开始构建检索知识库...")
-        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, user_id_list = None, None, None, None
+        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, tar_item_knowledge, user_id_list = None, None, None, None, None
         item_seq_all = None
         item_seq_len_all = None
         
@@ -464,35 +512,43 @@ class TTARArec(SequentialRecommender):
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID][look_up_indices].detach().cpu().numpy())
             
-            # 累积知识 - 三项内容：序列表征、原始交互序列、目标嵌入
+            # 累积知识 - 四项内容：序列表征、原始交互序列、目标嵌入、目标物品ID
             if isinstance(seq_emb_knowledge, np.ndarray):
                 seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             else:
                 seq_emb_knowledge = seq_output.detach().cpu().numpy()
             
-            # 新增：累积原始交互序列
+            # 累积原始交互序列
             if isinstance(item_seq_knowledge, np.ndarray):
                 item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
             else:
                 item_seq_knowledge = item_seq.detach().cpu().numpy()
             
+            # 累积目标嵌入
             if isinstance(tar_emb_knowledge, np.ndarray):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
             else:
                 tar_emb_knowledge = tar_items_emb.detach().cpu().numpy()
+            
+            # 累积目标物品ID
+            if isinstance(tar_item_knowledge, np.ndarray):
+                tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
+            else:
+                tar_item_knowledge = tar_items.detach().cpu().numpy()
             
             if isinstance(user_id_list, list):
                 user_id_list.extend(user_id_cans)
             else:
                 user_id_list = user_id_cans
         
-        # 保存知识库 - 三项内容
+        # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
         self.item_seq_all = item_seq_all
         self.item_seq_len_all = item_seq_len_all
         self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
         self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列
         self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
+        self.tar_item_knowledge = tar_item_knowledge  # 目标物品ID
         
         # 构建Faiss索引
         self._build_faiss_index()
@@ -500,12 +556,12 @@ class TTARArec(SequentialRecommender):
         # 标记知识库已构建
         self.knowledge_built = True
         print(f"知识库构建完成，包含 {len(user_id_list)} 个序列样本")
-        print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
+        print(f"知识库四项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}，目标物品ID维度 {self.tar_item_knowledge.shape}")
 
     def precached_knowledge_val(self, val_dataset):
         """为验证集构建知识库"""
         print("为验证集构建检索知识库...")
-        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, user_id_list = None, None, None, None
+        seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, tar_item_knowledge, user_id_list = None, None, None, None, None
         item_seq_len_all = None
         
         # 处理训练集
@@ -556,6 +612,12 @@ class TTARArec(SequentialRecommender):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
             else:
                 tar_emb_knowledge = tar_items_emb.detach().cpu().numpy()
+            
+            # 累积目标物品ID
+            if isinstance(tar_item_knowledge, np.ndarray):
+                tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
+            else:
+                tar_item_knowledge = tar_items.detach().cpu().numpy()
                 
             if isinstance(user_id_list, list):
                 user_id_list.extend(user_id_cans)
@@ -595,18 +657,25 @@ class TTARArec(SequentialRecommender):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
             else:
                 tar_emb_knowledge = tar_items_emb.detach().cpu().numpy()
+            
+            # 累积目标物品ID
+            if isinstance(tar_item_knowledge, np.ndarray):
+                tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
+            else:
+                tar_item_knowledge = tar_items.detach().cpu().numpy()
                 
             if isinstance(user_id_list, list):
                 user_id_list.extend(user_id_cans)
             else:
                 user_id_list = user_id_cans
                 
-        # 保存知识库 - 三项内容
+        # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
         self.item_seq_len_all = item_seq_len_all
         self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
         self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列  
         self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
+        self.tar_item_knowledge = tar_item_knowledge  # 目标物品ID
         
         # 构建Faiss索引
         self._build_faiss_index()
@@ -614,7 +683,7 @@ class TTARArec(SequentialRecommender):
         # 标记知识库已构建
         self.knowledge_built = True
         print(f"验证集知识库构建完成，包含 {len(user_id_list)} 个序列样本")
-        print(f"知识库三项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}")
+        print(f"知识库四项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}，目标物品ID维度 {self.tar_item_knowledge.shape}")
 
     def _build_faiss_index(self):
         """构建Faiss检索索引"""
@@ -644,15 +713,23 @@ class TTARArec(SequentialRecommender):
         """启用检索增强功能"""
         self.use_retrieval = True
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
+    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", pos_items=None, enhanced_sequences=None, item_seq=None, item_seq_len=None):
         """序列增强 - 使用训练后的交叉注意力层进行索引融合"""
-        # 检索相似序列和目标嵌入
-        retrieved_seqs, retrieved_item_seqs, retrieved_tars = self.retrieve_seq_tar(
-            seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
-        )
-        
-        # 使用交叉注意力层获得检索信息的融合表征
-        retrieval_enhanced_output = self.fusion_forward(seq_output, retrieved_seqs, retrieved_tars)
+        # 如果已有增强序列表征，直接使用；否则计算
+        if enhanced_sequences is not None:
+            # 直接使用预计算的增强序列表征
+            retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
+        else:
+            # 检索相似序列和目标物品ID
+            retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
+                seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
+            )
+            # 若能提供原始序列与长度，则计算增强序列表征；否则回退到原有K/V（retrieved_seqs/retrieved_tar_items）
+            if (item_seq is not None) and (item_seq_len is not None):
+                enhanced_sequences = self.compute_enhanced_sequences(
+                    retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
+                )
+                retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
         
         # 与原始序列表征进行加权融合
         augmented_output = seq_output * self.fusion_weight + retrieval_enhanced_output * (1 - self.fusion_weight)
@@ -677,11 +754,23 @@ class TTARArec(SequentialRecommender):
         
         # 根据训练状态决定是否使用检索增强
         if self.use_retrieval:
-            batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
-            batch_seq_len = list(item_seq_len.detach().cpu().numpy())
-            seq_output = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, mode="test")
+            batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
+            batch_seq_len = item_seq_len.detach().cpu().numpy()
+            seq_output = self.seq_augmented(
+                seq_output, batch_user_id, batch_seq_len, mode="test",
+                item_seq=item_seq, item_seq_len=item_seq_len
+            )
         
         # 计算与所有物品的得分
         test_items_emb = self.pretrained_model.item_embedding.weight
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+        if self.final_test_mode:
+            with torch.no_grad():
+                topk = min(self.final_test_topk, scores.size(1))
+                _, top_indices = torch.topk(scores, k=topk, dim=1)
+                top_indices_cpu = top_indices.detach().cpu().numpy()
+                for i in range(top_indices_cpu.shape[0]):
+                    print(f"[Final-Test-Top{topk}] Sample {i} -> items: {top_indices_cpu[i].tolist()}")
+        
         return scores
+
