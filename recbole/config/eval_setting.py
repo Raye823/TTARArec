@@ -196,7 +196,7 @@ class EvalSetting(object):
         """Setting about split method
 
         Args:
-            strategy (str): Either ``none``, ``by_ratio``, ``by_value`` or ``loo``.
+            strategy (str): Either ``none``, ``by_ratio``, ``by_value``, ``loo`` or ``user_split``.
             ratios (list of float): Dataset will be splited into `len(ratios)` parts.
             field (str): Split by values of field.
             values (list of float or float): Dataset will be splited into `len(values) + 1` parts.
@@ -207,12 +207,15 @@ class EvalSetting(object):
             >>> es.leave_one_out()
             >>> es.split_by_ratio(ratios=[0.8, 0.1, 0.1])
             >>> es.split_by_value(field='month', values=[6, 7], ascending=False)    # (*, 7], (7, 6], (6, *)
+            >>> es.user_split(ratios=[8, 1, 1])    # User-based splitting 8:1:1
         """
-        legal_strategy = {'none', 'by_ratio', 'by_value', 'loo'}
+        legal_strategy = {'none', 'by_ratio', 'by_value', 'loo', 'user_split'}
         if strategy not in legal_strategy:
             raise ValueError('Split Strategy [{}] should in {}'.format(strategy, list(legal_strategy)))
         if strategy == 'loo' and self.group_field is None:
             raise ValueError('Leave-One-Out request group firstly')
+        if strategy == 'user_split' and self.group_field is None:
+            raise ValueError('User-Split request group firstly')
         self.split_args = {'strategy': strategy}
         self.split_args.update(kwargs)
 
@@ -240,6 +243,20 @@ class EvalSetting(object):
         if not isinstance(ratios, list):
             raise ValueError('ratios [{}] should be list'.format(ratios))
         self.set_splitting(strategy='by_ratio', ratios=ratios)
+
+    def user_split(self, ratios):
+        """ Setting about User-based Splitting.
+        
+        Split users into different groups according to ratios, keeping each user's 
+        complete interaction sequence in the same dataset.
+
+        Args:
+            ratios (list of float): ratio of each part.
+                No need to normalize. It's ok with either `[0.8, 0.1, 0.1]`, `[8, 1, 1]` or `[56, 7, 7]`
+        """
+        if not isinstance(ratios, list):
+            raise ValueError('ratios [{}] should be list'.format(ratios))
+        self.set_splitting(strategy='user_split', ratios=ratios)
 
     def _split_by_value(self, field, values, ascending=True):
         raise NotImplementedError('Split by value has not been implemented.')
@@ -283,7 +300,7 @@ class EvalSetting(object):
         """Setting about ordering and split method.
 
         Args:
-            es_str (str): Ordering and splitting method string. Either ``RO_RS``, ``RO_LS``, ``TO_RS`` or ``TO_LS``.
+            es_str (str): Ordering and splitting method string. Either ``RO_RS``, ``RO_LS``, ``TO_RS``, ``TO_LS`` or ``TO_US``.
         """
         args = es_str.split('_')
         if len(args) != 2:
@@ -310,6 +327,12 @@ class EvalSetting(object):
             if leave_one_num is None:
                 raise ValueError('`leave_one_num` should be set if `LS` is set.')
             self.leave_one_out(leave_one_num=leave_one_num)
+        elif split_args == 'US':
+            # User Split: 按用户分组分割
+            user_split_ratios = self.config['user_split_ratios']
+            if user_split_ratios is None:
+                raise ValueError('`user_split_ratios` should be set if `US` is set.')
+            self.user_split(user_split_ratios)
         else:
             raise NotImplementedError(f'Split args `{split_args}` is not implemented.')
 

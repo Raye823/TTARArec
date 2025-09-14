@@ -29,7 +29,7 @@ training_arguments = [
 evaluation_arguments = [
     'eval_setting',
     'group_by_user',
-    'split_ratio', 'leave_one_num',
+    'split_ratio', 'leave_one_num', 'user_split_ratios',
     'real_time_process',
     'metrics', 'topk', 'valid_metric',
     'eval_batch_size',
