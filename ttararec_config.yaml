@@ -77,14 +77,10 @@ weight_decay: 0
 # 评估设置
 # ======================================
 eval_batch_size: 256
-eval_setting: TO_US,full
+eval_setting: TO_LS,full
 metrics: ["Recall", "NDCG"]
 valid_metric: NDCG@10
 topk: [5, 10, 20, 50]
-
-# 用户分组设置
-group_by_user: true                  # 必须设置为true，用于用户分组
-user_split_ratios: [8, 1, 1]        # 训练:验证:测试 = 8:1:1
 
 # ======================================
 # TTARArec检索增强参数

@@ -128,11 +128,6 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     logger.info("="*50)
     logger.info(config)
     
-    # 检查是否使用用户分组数据集
-    if 'TO_US' in config['eval_setting']:
-        logger.info("使用用户分组数据划分方式")
-        logger.info(f"用户分组比例: {config['user_split_ratios']}")
-    
     # 数据集过滤
     dataset = create_dataset(config)
     logger.info(dataset)

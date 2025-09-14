@@ -41,28 +41,72 @@ class SequentialDataset(Dataset):
     def prepare_data_augmentation(self):
         """Augmentation processing for sequential dataset.
 
-        E.g., ``u1`` has purchase sequence ``<i1, i2, i3, i4>``,
-        then after augmentation, we will generate three cases.
+        For TTARArec model: Only generate the last 3 samples per user for train/valid/test.
+        For other models: Use original data augmentation strategy.
+        
+        E.g., for TTARArec with ``u1`` purchase sequence ``<i1, i2, i3, i4, i5>``:
+        ``u1, <i1, i2> | i3``  (for training)
+        ``u1, <i1, i2, i3> | i4``  (for validation)
+        ``u1, <i1, i2, i3, i4> | i5``  (for testing)
 
-        ``u1, <i1> | i2``
-
-        (Which means given user_id ``u1`` and item_seq ``<i1>``,
-        we need to predict the next item ``i2``.)
-
-        The other cases are below:
-
-        ``u1, <i1, i2> | i3``
-
-        ``u1, <i1, i2, i3> | i4``
-
-        Note:
-            Actually, we do not really generate these new item sequences.
-            One user's item sequence is stored only once in memory.
-            We store the index (slice) of each item sequence after augmentation,
-            which saves memory and accelerates a lot.
+        For other models: Original augmentation strategy.
         """
-        self.logger.debug('prepare_data_augmentation')
+        # 检查是否为TTARArec模型
+        model_name = self.config.get('model', '').lower()
+        use_ttararec_augmentation = (model_name == 'ttararec')
+        
+        if use_ttararec_augmentation:
+            self.logger.debug('prepare_data_augmentation - TTARArec模式: 每用户最后3个样本')
+            self._prepare_ttararec_augmentation()
+        else:
+            self.logger.debug('prepare_data_augmentation - 原始模式')
+            self._prepare_original_augmentation()
 
+    def _prepare_ttararec_augmentation(self):
+        """TTARArec专用的数据增强策略：每用户只生成最后3个样本"""
+        self._check_field('uid_field', 'time_field')
+        max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']
+        self.sort(by=[self.uid_field, self.time_field], ascending=True)
+        
+        # 获取每个用户的交互序列
+        user_interactions = {}
+        for i, uid in enumerate(self.inter_feat[self.uid_field].numpy()):
+            if uid not in user_interactions:
+                user_interactions[uid] = []
+            user_interactions[uid].append(i)
+        
+        uid_list, item_list_index, target_index, item_list_length = [], [], [], []
+        
+        # 为每个用户只生成最后3个样本
+        for uid, interactions in user_interactions.items():
+            if len(interactions) >= 4:  # 至少需要4个交互才能产生3个样本
+                # 限制序列长度，确保最长历史序列不超过max_item_list_len
+                if len(interactions) > max_item_list_len + 1:
+                    interactions = interactions[-(max_item_list_len + 1):]
+                
+                total_len = len(interactions)
+                # 只生成最后3个样本：倒数第3、2、1个
+                for i in range(3):
+                    target_pos = total_len - 3 + i  # 倒数第3、2、1个位置
+                    history_end = target_pos - 1    # 历史序列结束位置
+                    
+                    # 确保历史序列长度不超过限制
+                    if history_end >= 0 and history_end + 1 <= max_item_list_len:
+                        uid_list.append(uid)
+                        item_list_index.append(slice(interactions[0], interactions[history_end] + 1))
+                        target_index.append(interactions[target_pos])
+                        item_list_length.append(history_end + 1)
+
+        self.uid_list = np.array(uid_list)
+        self.item_list_index = np.array(item_list_index)
+        self.target_index = np.array(target_index)
+        self.item_list_length = np.array(item_list_length, dtype=np.int64)
+        self.mask = np.ones(len(self.inter_feat), dtype=np.bool_)
+        
+        self.logger.info(f'TTARArec数据增强完成，每用户最后3个样本，总样本数: {len(self.uid_list)}')
+
+    def _prepare_original_augmentation(self):
+        """原始的数据增强策略：保持兼容性"""
         self._check_field('uid_field', 'time_field')
         max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']
         self.sort(by=[self.uid_field, self.time_field], ascending=True)

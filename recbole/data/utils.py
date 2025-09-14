@@ -39,13 +39,8 @@ def create_dataset(config):
     else:
         model_type = config['MODEL_TYPE']
         if model_type == ModelType.SEQUENTIAL:
-            # 检查是否使用用户分组数据集
-            if config['use_user_split'] or 'TO_US' in config['eval_setting']:
-                from .dataset.user_split_sequential_dataset import UserSplitSequentialDataset
-                return UserSplitSequentialDataset(config)
-            else:
-                from .dataset import SequentialDataset
-                return SequentialDataset(config)
+            from .dataset import SequentialDataset
+            return SequentialDataset(config)
         elif model_type == ModelType.KNOWLEDGE:
             from .dataset import KnowledgeBasedDataset
             return KnowledgeBasedDataset(config)
@@ -58,19 +53,6 @@ def create_dataset(config):
         else:
             from .dataset import Dataset
             return Dataset(config)
-
-
-def create_user_split_dataset(config):
-    """Create user split dataset specifically for user-based splitting.
-    
-    Args:
-        config (Config): An instance object of Config, used to record parameter information.
-
-    Returns:
-        UserSplitSequentialDataset: User split dataset instance.
-    """
-    from .dataset.user_split_sequential_dataset import UserSplitSequentialDataset
-    return UserSplitSequentialDataset(config)
 
 
 def data_preparation(config, dataset, save=False):
