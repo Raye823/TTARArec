@@ -103,6 +103,21 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     init_logger(config)
     logger = getLogger()
     
+    # 配置TTARArec专用日志器，复用当前run的log.txt
+    import logging
+    tt_logger = logging.getLogger("TTARArec")
+    tt_logger.setLevel(logging.INFO)
+    tt_logger.propagate = False
+    # 从当前logger获取文件路径
+    if logger.handlers:
+        for h in logger.handlers:
+            if hasattr(h, 'baseFilename'):
+                fh = logging.FileHandler(h.baseFilename, mode="a", encoding="utf-8")
+                fh.setLevel(logging.INFO)
+                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%y-%m-%d %H:%M"))
+                tt_logger.addHandler(fh)
+                break
+    
     # 获取日志目录
     import os
     log_dir = os.path.dirname(logger.handlers[0].baseFilename)

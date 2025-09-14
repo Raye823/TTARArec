@@ -1,5 +1,13 @@
 import torch
 import numpy as np
+import logging
+import os
+
+logger = logging.getLogger("TTARArec")
+logger.setLevel(logging.INFO)
+logger.propagate = False  # 不向root传播，避免控制台处理器
+
+# 不自动绑定文件处理器，等待外部配置
 
 
 def compute_retrieval_effectiveness_vectorized(model, retrieved_item_seqs, pos_items, item_seq, item_seq_len, batch_seq_len, retrieved_seqs=None, retrieved_tar_items=None, enhanced_sequences=None):
@@ -119,6 +127,84 @@ def compute_retrieval_effectiveness_vectorized(model, retrieved_item_seqs, pos_i
             top_new_seq_outputs = model.forward(top_batch_new_seqs, top_new_seq_lens)  # [B, H]
             top_similarities = torch.sum(top_new_seq_outputs * pos_items_emb, dim=-1)  # [B]
             top_retrieval_similarity = top_similarities.mean().item()
+
+    # ========== 调试信息（每129个batch打印一次） ==========
+    try:
+        if hasattr(model, 'batch_count') and (model.batch_count % 129 == 0):
+            # 安全获取B、K
+            B = item_seq.size(0)
+            K = retrieved_item_seqs.size(1)
+            if B > 0 and K > 0:
+                # 随机选择一个样本索引
+                rand_idx = torch.randint(low=0, high=B, size=(1,), device=item_seq.device).item()
+                # 确保有seq_output用于打印原始表征
+                if 'seq_output' not in locals():
+                    seq_output = model.forward(item_seq, item_seq_len)
+                # 取该样本的原始表征与目标项
+                sample_seq_repr = seq_output[rand_idx]
+                sample_pos_item = pos_items[rand_idx]
+                # 取该样本检索到的K个序列表征与目标项
+                if retrieved_seqs is not None:
+                    sample_ret_seq_repr = retrieved_seqs[rand_idx]  # [K, H]
+                else:
+                    # 若未提供retrieved_seqs，则回退为空（不打印表征）
+                    sample_ret_seq_repr = None
+                sample_ret_tar_items = None
+                if retrieved_tar_items is not None:
+                    sample_ret_tar_items = retrieved_tar_items[rand_idx]  # [K]
+
+                # 构造需要打印的“物品序列ID列表”（尽量只搬一条到CPU）
+                # 原始序列（按真实长度截断）
+                sample_len = int(item_seq_len[rand_idx].item()) if torch.is_tensor(item_seq_len) else int(item_seq_len[rand_idx])
+                sample_item_seq_ids = item_seq[rand_idx].detach().cpu().tolist()
+                sample_item_seq_ids = sample_item_seq_ids[:sample_len] if sample_len > 0 else []
+                # 检索到的K个序列（完整打印，含padding 0）
+                sample_ret_item_seqs = retrieved_item_seqs[rand_idx].detach().cpu().tolist()
+                # 目标项
+                sample_pos_item_cpu = sample_pos_item.detach().cpu().item() if torch.is_tensor(sample_pos_item) else int(sample_pos_item)
+                sample_ret_tar_items_cpu = sample_ret_tar_items.detach().cpu().tolist() if sample_ret_tar_items is not None else None
+
+                # 打印
+                logger.info("\n--- 调试样本（每129个batch一次）---")
+                # 打印样本索引与用户ID；样本索引是本batch内的下标 [0, B)
+                sample_user = None
+                # 优先从模型暂存的当前batch用户ID中获取（由训练侧传入的numpy数组）
+                cb_users = getattr(model, '_current_batch_user_ids', None)
+                if cb_users is not None and len(cb_users) > rand_idx:
+                    try:
+                        sample_user = int(cb_users[rand_idx])
+                    except Exception:
+                        sample_user = None
+                logger.info(f"样本索引: {rand_idx} | user: {sample_user if sample_user is not None else '?'}")
+                logger.info(f"原始物品序列: {sample_item_seq_ids}")
+                logger.info(f"目标项ID: {sample_pos_item_cpu}")
+                logger.info(f"检索到的K个物品序列 (K={K}):")
+                # 为每个检索序列附上所属用户ID（通过在知识库中匹配序列获得）
+                kb_seqs = getattr(model, 'item_seq_knowledge', None)
+                kb_users = getattr(model, 'user_id_list', None)
+                for kk, seq_ids in enumerate(sample_ret_item_seqs):
+                    user_of_seq = None
+                    if kb_seqs is not None and kb_users is not None:
+                        try:
+                            seq_np = np.array(seq_ids)
+                            # 直接全行匹配（包含padding）
+                            matches = np.where((kb_seqs == seq_np).all(axis=1))[0]
+                            if matches.size > 0:
+                                user_of_seq = kb_users[matches[0]]
+                        except Exception:
+                            user_of_seq = None
+                    if user_of_seq is None:
+                        logger.info(f"  #{kk}: {seq_ids} | user: ?")
+                    else:
+                        logger.info(f"  #{kk}: {seq_ids} | user: {int(user_of_seq)}")
+                if sample_ret_tar_items_cpu is not None:
+                    logger.info(f"检索到的K个目标项ID: {sample_ret_tar_items_cpu}")
+                else:
+                    logger.info("检索到的目标项ID: 未提供retrieved_tar_items，跳过目标项打印")
+                logger.info("--------------------------------\n")
+    except Exception as e:
+        # 调试打印不影响主流程
+        logger.warning(f"[调试打印异常忽略] {e}")
     
     return max_similarities.mean().item(), augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency
 
@@ -201,43 +287,43 @@ def print_diagnostic_info_optimized(model, rec_loss, kl_loss, retrieval_probs, a
         cpu_metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in gpu_metrics.items()}
         
         # 输出结果
-        print(f"\n========== 诊断信息 (Batch {model.batch_count}) ==========")
-        print(f"推荐损失: {cpu_metrics['rec_loss']:.6f}")
-        print(f"KL散度损失: {cpu_metrics['kl_loss']:.6f}")
-        print(f"总损失: {cpu_metrics['total_loss']:.6f}")
+        logger.info(f"\n========== 诊断信息 (Batch {model.batch_count}) ==========")
+        logger.info(f"推荐损失: {cpu_metrics['rec_loss']:.6f}")
+        logger.info(f"KL散度损失: {cpu_metrics['kl_loss']:.6f}")
+        logger.info(f"总损失: {cpu_metrics['total_loss']:.6f}")
         
-        print(f"\n--- 评分分布 ---")
-        print(f"检索评分标准差: {cpu_metrics['retrieval_std']:.6f}")
-        print(f"检索评分熵: {cpu_metrics['retrieval_entropy']:.6f}")
+        logger.info(f"\n--- 评分分布 ---")
+        logger.info(f"检索评分标准差: {cpu_metrics['retrieval_std']:.6f}")
+        logger.info(f"检索评分熵: {cpu_metrics['retrieval_entropy']:.6f}")
         
-        print(f"注意力评分标准差: {cpu_metrics['attention_std']:.6f}")
-        print(f"注意力评分熵: {cpu_metrics['attention_entropy']:.6f}")
-        print(f"检索评分与注意力评分相关性: {cpu_metrics['correlation']:.6f}")
-        print(f"检索评分与注意力评分排序相关性: {cpu_metrics['rank_correlation']:.6f}")
-        print(f"Top-1选择一致性: {cpu_metrics['top1_consistency']:.6f}")
+        logger.info(f"注意力评分标准差: {cpu_metrics['attention_std']:.6f}")
+        logger.info(f"注意力评分熵: {cpu_metrics['attention_entropy']:.6f}")
+        logger.info(f"检索评分与注意力评分相关性: {cpu_metrics['correlation']:.6f}")
+        logger.info(f"检索评分与注意力评分排序相关性: {cpu_metrics['rank_correlation']:.6f}")
+        logger.info(f"Top-1选择一致性: {cpu_metrics['top1_consistency']:.6f}")
         
-        print(f"\n--- 增强效果 ---")
-        print(f"原始序列与增强序列相似度: {cpu_metrics['seq_similarity']:.6f}")
-        print(f"原始序列与目标项相似度: {cpu_metrics['original_sim']:.6f}")
-        print(f"增强序列与目标项相似度: {cpu_metrics['augmented_sim']:.6f}")
-        print(f"增强带来的相似度提升: {cpu_metrics['sim_improvement']:.6f}")
-        print(f"原始序列Top-1负样本间隔: {cpu_metrics['original_margin_top1']:.6f}")
-        print(f"增强序列Top-1负样本间隔: {cpu_metrics['augmented_margin_top1']:.6f}")
-        print(f"Top-1间隔提升: {cpu_metrics['margin_top1_improvement']:.6f}")
-        print(f"原始序列Top-10均值负样本间隔: {cpu_metrics['original_margin_topk']:.6f}")
-        print(f"增强序列Top-10均值负样本间隔: {cpu_metrics['augmented_margin_topk']:.6f}")
-        print(f"Top-10间隔提升: {cpu_metrics['margin_topk_improvement']:.6f}")
+        logger.info(f"\n--- 增强效果 ---")
+        logger.info(f"原始序列与增强序列相似度: {cpu_metrics['seq_similarity']:.6f}")
+        logger.info(f"原始序列与目标项相似度: {cpu_metrics['original_sim']:.6f}")
+        logger.info(f"增强序列与目标项相似度: {cpu_metrics['augmented_sim']:.6f}")
+        logger.info(f"增强带来的相似度提升: {cpu_metrics['sim_improvement']:.6f}")
+        logger.info(f"原始序列Top-1负样本间隔: {cpu_metrics['original_margin_top1']:.6f}")
+        logger.info(f"增强序列Top-1负样本间隔: {cpu_metrics['augmented_margin_top1']:.6f}")
+        logger.info(f"Top-1间隔提升: {cpu_metrics['margin_top1_improvement']:.6f}")
+        logger.info(f"原始序列Top-10均值负样本间隔: {cpu_metrics['original_margin_topk']:.6f}")
+        logger.info(f"增强序列Top-10均值负样本间隔: {cpu_metrics['augmented_margin_topk']:.6f}")
+        logger.info(f"Top-10间隔提升: {cpu_metrics['margin_topk_improvement']:.6f}")
         
-        print(f"\n--- 检索效果 ---")
-        print(f"最佳检索序列拼接后相似度: {retrieval_effectiveness:.6f}")
-        print(f"表征相似度最高索引拼接后相似度: {top_retrieval_similarity:.6f}")
+        logger.info(f"\n--- 检索效果 ---")
+        logger.info(f"最佳检索序列拼接后相似度: {retrieval_effectiveness:.6f}")
+        logger.info(f"表征相似度最高索引拼接后相似度: {top_retrieval_similarity:.6f}")
         
         
-        print(f"\n--- 索引一致性分析 ---")
-        print(f"最佳增强效果索引与表征相似度最高索引一致性: {augment_retrieval_consistency:.6f} ({augment_retrieval_consistency*100:.2f}%)")
-        print(f"融合权重最高索引与表征相似度最高索引一致性: {fusion_retrieval_consistency:.6f} ({fusion_retrieval_consistency*100:.2f}%)")
-        print(f"最佳增强效果索引与融合权重最高索引一致性: {augment_fusion_consistency:.6f} ({augment_fusion_consistency*100:.2f}%)")
-        print(f"========================================\n")
+        logger.info(f"\n--- 索引一致性分析 ---")
+        logger.info(f"最佳增强效果索引与表征相似度最高索引一致性: {augment_retrieval_consistency:.6f} ({augment_retrieval_consistency*100:.2f}%)")
+        logger.info(f"融合权重最高索引与表征相似度最高索引一致性: {fusion_retrieval_consistency:.6f} ({fusion_retrieval_consistency*100:.2f}%)")
+        logger.info(f"最佳增强效果索引与融合权重最高索引一致性: {augment_fusion_consistency:.6f} ({augment_fusion_consistency*100:.2f}%)")
+        logger.info(f"========================================\n")
 
 
 def get_attention_grad_norms(model):
