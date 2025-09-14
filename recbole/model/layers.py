@@ -451,7 +451,7 @@ class CrossMultiHeadAttention(nn.Module):
         x = x.view(*new_x_shape)
         return x.permute(0, 2, 1, 3)
 
-    def forward(self, input_query, input_key, input_value):
+    def forward(self, input_query, input_key, input_value, return_attention=False):
         mixed_query_layer = self.query(input_query)
         mixed_key_layer = self.key(input_key)
         mixed_value_layer = self.value(input_value)

@@ -315,12 +315,14 @@ class TTARArec(SequentialRecommender):
             topk=self.topk
         )
 
-        # 新的训练流程：不需要增强序列表征，直接使用检索序列
-            
-        # 计算主要的推荐损失（基于原始序列）
-        all_items_emb = self.pretrained_model.item_embedding.weight
-        logits = torch.matmul(seq_output, all_items_emb.transpose(0, 1))
-        rec_loss = self.loss_fct(logits, pos_items)
+        # 新的训练流程：使用inference_augmentation得到增强后的logits
+        
+        # 计算增强后的推荐损失（基于检索增强的final_logits）
+        # 复用已检索的序列，避免重复检索
+        final_logits = self.inference_augmentation(
+            seq_output, mode="train", retrieved_seqs=retrieved_seqs
+        )
+        rec_loss = self.loss_fct(final_logits, pos_items)
 
         # 计算检索评分（基于熵加权融合的CE损失概率权重）
         retrieval_probs = self.compute_retrieval_scores(seq_output, retrieved_seqs, pos_items)  # [B, K]
@@ -589,18 +591,26 @@ class TTARArec(SequentialRecommender):
         """启用检索增强功能"""
         self.use_retrieval = True
 
-    def inference_augmentation(self, seq_output, batch_user_id, batch_seq_len, mode="test"):
+    def inference_augmentation(self, seq_output, batch_user_id=None, batch_seq_len=None, mode="test", retrieved_seqs=None):
         """
         推理增强：基于熵的动态融合
         1. 输入序列得到logits1
         2. attention融合检索序列得到融合序列表征
         3. 融合序列表征得到logits2
         4. 基于两个logits的熵计算α，最终融合为flogits
+        
+        Args:
+            seq_output: 序列输出表征
+            batch_user_id: 用户ID（当retrieved_seqs为None时需要）
+            batch_seq_len: 序列长度（当retrieved_seqs为None时需要）
+            mode: 模式
+            retrieved_seqs: 已检索的序列（可选，避免重复检索）
         """
-        # 检索相似序列
-        retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
-            seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
-        )
+        # 检索相似序列（如果未提供）
+        if retrieved_seqs is None:
+            retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
+                seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
+            )
         
         all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
         
