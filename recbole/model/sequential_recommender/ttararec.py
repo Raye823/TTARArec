@@ -52,10 +52,6 @@ class TTARArec(SequentialRecommender):
         self.initializer_range = config['initializer_range']
         # 损失类型（CE 或 BPR）
         self.loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
-        self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
-        # BPR硬负采样配置
-        self.bpr_num_negatives = config['bpr_num_negatives'] if 'bpr_num_negatives' in config else 1
-        self.bpr_hard_negatives = config['bpr_hard_negatives'] if 'bpr_hard_negatives' in config else False
         # 定义损失函数
         if self.loss_type == 'BPR':
             self.loss_fct = BPRLoss()
@@ -72,8 +68,6 @@ class TTARArec(SequentialRecommender):
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
-        # 检索评分负信号配置
-        self.retrieval_num_negatives = config['retrieval_num_negatives'] if 'retrieval_num_negatives' in config else 3
 
         # ========== 4. 设置训练相关参数 ==========
         # 损失权重
@@ -81,12 +75,13 @@ class TTARArec(SequentialRecommender):
         # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
         self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
+        self.retrieval_tau = config['retrieval_tau'] if 'retrieval_tau' in config else 1.0
 
         # 测试阶段输出Top-K推荐结果控制（仅最终测试使用）
         self.final_test_mode = False
         self.final_test_topk = 30
         # ========== 5. 构建检索器和融合组件 ==========
-        self._build_retrieval_components(config)
+        self._build_fusion_components(config)
 
         # ========== 6. 初始化检索知识库相关变量 ==========
         self.dataset = dataset
@@ -103,27 +98,11 @@ class TTARArec(SequentialRecommender):
         # 训练状态控制
         self.use_retrieval = False  # 初始时不使用检索增强
 
-    def _build_retrieval_components(self, config):
-        """构建检索器MLP层和交叉注意力融合组件"""
-        # 检索器编码器相关参数
-        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 0
-        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0
-                
-        # 激活函数和dropout
-        self.retriever_act_fn = activation_layer(self.hidden_act)
-        self.retriever_dropout_layer = nn.Dropout(self.retriever_dropout)
+        # TTARArec日志器配置已移至run_ttararec.py中统一处理
 
-        # 构建检索器MLP层
-        self.retriever_mlp = nn.ModuleList()
-        self.retriever_layer_norms = nn.ModuleList()
-        
-        for i in range(self.retriever_layers):
-            self.retriever_mlp.append(
-                nn.Linear(self.hidden_size, self.hidden_size)
-            )
-            self.retriever_layer_norms.append(
-                nn.LayerNorm(self.hidden_size)
-            )
+    def _build_fusion_components(self, config):
+        """交叉注意力融合组件"""
+
 
         # 交叉注意力融合机制参数（独立于预训练模型参数）
         self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 1
@@ -147,15 +126,9 @@ class TTARArec(SequentialRecommender):
         self.fusion_position_embedding = nn.Embedding(self.topk, self.hidden_size)
         
         # 构建完成后立即初始化权重
-        self._init_component_weights()
+        self._init_attention_weights()
 
-    def _init_component_weights(self):
-        """初始化检索器和融合组件的权重"""
-        # 初始化检索器MLP和LayerNorm
-        self.retriever_mlp.apply(self._init_weights)
-        for layer_norm in self.retriever_layer_norms:
-            self._init_weights(layer_norm)
-        
+    def _init_attention_weights(self):
         # 初始化交叉注意力融合机制
         # PyTorch MultiheadAttention 已内置初始化
         self.fusion_ffn.apply(self._init_weights)
@@ -181,24 +154,6 @@ class TTARArec(SequentialRecommender):
         """序列编码 - 直接调用预训练模型"""
         with torch.no_grad():
             return self.pretrained_model.forward(item_seq, item_seq_len)
-
-    def retriever_forward(self, seq_output):
-        """检索器编码器前向传播 - 使用MLP对序列表示进行非线性变换"""
-        hidden = seq_output  # [B, H]
-        
-        # 应用MLP层
-        for idx, (layer, layer_norm) in enumerate(zip(self.retriever_mlp, self.retriever_layer_norms)):
-            residual = hidden  # 残差连接
-            
-            # MLP变换
-            hidden = layer(hidden)
-            hidden = self.retriever_act_fn(hidden)
-            hidden = self.retriever_dropout_layer(hidden)
-            
-            # Layer Norm + 残差连接
-            hidden = layer_norm(hidden + residual)
-        
-        return hidden
     
     def fusion_forward(self, seq_output, key_sequences, value_sequences=None):
         """交叉注意力融合机制前向传播（使用nn.MultiheadAttention）"""
@@ -246,88 +201,73 @@ class TTARArec(SequentialRecommender):
         )   
     # ============ 损失计算相关方法 ============
 
-
-
-    def compute_enhanced_sequences(self, retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output):
-        """计算增强序列表征 - 将检索到的目标物品ID拼接到原始序列末尾（完全GPU向量化）"""
-        batch_size, n_retrieved = retrieved_tar_items.size()
-        max_seq_len = item_seq.size(1)
+    def compute_entropy(self, logits):
+        """计算logits的熵"""
+        probs = F.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+        return entropy
+    
+    def compute_alpha_weights(self, logits1, logits2):
+        """基于两个logits的熵计算融合权重α"""
+        h1 = self.compute_entropy(logits1)  # [B] 或 [B,K]
+        h2 = self.compute_entropy(logits2)  # [B] 或 [B,K]
         
-        # 将batch_seq_len转换为GPU张量
-        current_seq_lens = torch.from_numpy(batch_seq_len).to(item_seq.device)
+        exp_h1 = torch.exp(1.0 / (1.0 + h1))
+        exp_h2 = torch.exp(1.0 / (1.0 + h2))
+        alpha = exp_h1 / (exp_h1 + exp_h2)
         
-        # 批量处理所有检索结果，避免循环
-        # 扩展原始序列以匹配检索数量 [B, K, max_seq_len]
-        item_seq_expanded = item_seq.unsqueeze(1).expand(-1, n_retrieved, -1)
-        enhanced_seqs = item_seq_expanded.clone()  # [B, K, max_seq_len]
+        return alpha
+    
+    def entropy_weighted_fusion(self, logits1, logits2):
+        """基于熵的加权融合，返回融合后的logits"""
+        alpha = self.compute_alpha_weights(logits1, logits2)
+        # 扩展alpha的维度以匹配logits
+        if logits1.dim() == 3:  # [B, K, N]
+            alpha = alpha.unsqueeze(-1)  # [B, K, 1]
+        elif logits1.dim() == 2:  # [B, N]
+            alpha = alpha.unsqueeze(-1)  # [B, 1]
         
-        # 计算新序列长度（原序列长度 + 1个目标物品）
-        new_seq_lens = torch.clamp(current_seq_lens + 1, max=max_seq_len)  # [B]
-        new_seq_lens_expanded = new_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-        
-        # 向量化添加目标物品到序列末尾
-        batch_indices = torch.arange(batch_size, device=item_seq.device).unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-        retrieve_indices = torch.arange(n_retrieved, device=item_seq.device).unsqueeze(0).expand(batch_size, -1)  # [B, K]
-        
-        # 创建掩码：只在序列长度小于max_seq_len时添加目标物品
-        valid_append_mask = current_seq_lens.unsqueeze(1) < max_seq_len  # [B, 1]
-        
-        # 使用高级索引批量设置目标物品
-        if valid_append_mask.any():
-            # 获取可以添加目标物品的位置
-            append_positions = current_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-            
-            # 创建索引张量来批量设置值
-            valid_positions = append_positions < max_seq_len
-            if valid_positions.any():
-                # 使用scatter_方法批量设置目标物品
-                batch_idx_flat = batch_indices[valid_positions]
-                retrieve_idx_flat = retrieve_indices[valid_positions]
-                position_flat = append_positions[valid_positions]
-                target_items_flat = retrieved_tar_items[batch_idx_flat, retrieve_idx_flat]
-                
-                enhanced_seqs[batch_idx_flat, retrieve_idx_flat, position_flat] = target_items_flat
-        
-        # 批量重新编码所有增强序列
-        # 将[B, K, max_seq_len]重塑为[B*K, max_seq_len]进行批量编码
-        enhanced_seqs_flat = enhanced_seqs.reshape(batch_size * n_retrieved, max_seq_len)
-        new_seq_lens_flat = new_seq_lens_expanded.reshape(batch_size * n_retrieved)
-        
-        # 批量编码
-        enhanced_outputs_flat = self.forward(enhanced_seqs_flat, new_seq_lens_flat)  # [B*K, hidden_size]
-        
-        # 重塑回[B, K, hidden_size]
-        enhanced_sequences = enhanced_outputs_flat.reshape(batch_size, n_retrieved, -1)
-        
-        return enhanced_sequences
-
-    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None, query_output=None, neg_items=None):
-        batch_size = pos_items.size(0)
-        n_retrieved = enhanced_sequences.size(1) 
-        pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
+        fused_logits = alpha * logits1 + (1 - alpha) * logits2
+        return fused_logits
+    
+    def compute_retrieval_scores(self, seq_output, retrieved_seqs, pos_items):
+        """
+        新的检索评分计算逻辑：
+        1. 原始序列对全物品集打分得到logits1
+        2. 检索序列对全物品集打分得到logits2  
+        3. 基于熵计算α，融合得到flogits
+        4. 每个flogits与pos_item计算CE损失
+        5. 将损失softmax得到概率权重
+        """
+        batch_size, n_retrieved, hidden_size = retrieved_seqs.shape
         all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
-
-        if enhanced_sequences is not None:
-            # 按逐序列BPR损失对齐
-            if neg_items is not None:
-                # 正项分数 [B, K]
-                pos_scores_k = torch.sum(enhanced_sequences * pos_items_emb.unsqueeze(1), dim=-1)
-                # 负项分数
-                neg_items_emb = self.get_item_embedding(neg_items)  # [B,H] 或 [B,n_neg,H]
-                if neg_items_emb.dim() == 2:
-                    # 单负样本：为每个增强序列重复该负样本
-                    neg_scores_k = torch.sum(enhanced_sequences * neg_items_emb.unsqueeze(1), dim=-1)  # [B,K]
-                    bpr_k = F.softplus(-(pos_scores_k - neg_scores_k))  # [B,K]
-                else:
-                    # 多负样本：对每个增强序列与所有负样本逐对计算，再对负样本求均值
-                    # neg_items_emb: [B,n_neg,H] -> [B,1,n_neg,H]
-                    neg_scores_all = torch.sum(
-                        enhanced_sequences.unsqueeze(2) * neg_items_emb.unsqueeze(1), dim=-1
-                    )  # [B,K,n_neg]
-                    bpr_k = F.softplus(-(pos_scores_k.unsqueeze(2) - neg_scores_all)).mean(dim=2)  # [B,K]
-                logits = -bpr_k  # 损失越小越好
-                tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1
-        return torch.softmax(logits / max(tau, 1e-6), dim=1).detach()
+        
+        # 1. 原始序列对全物品集打分
+        logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]
+        
+        # 2. 检索序列对全物品集打分
+        logits2 = torch.matmul(retrieved_seqs, all_items_emb.transpose(0, 1))  # [B, K, N]
+        
+        # 3. 对每个检索序列与原始序列进行熵加权融合
+        fused_logits_list = []
+        ce_losses = []
+        
+        for k in range(n_retrieved):
+            logits2_k = logits2[:, k, :]  # [B, N]
+            # 基于熵融合
+            fused_logits_k = self.entropy_weighted_fusion(logits1, logits2_k)  # [B, N]
+            fused_logits_list.append(fused_logits_k)
+            
+            # 计算CE损失 - 使用F.cross_entropy确保返回[B]形状
+            ce_loss_k = F.cross_entropy(fused_logits_k, pos_items, reduction='none')  # [B]
+            ce_losses.append(ce_loss_k)
+        
+        # 4. 将K个CE损失转为概率权重（损失越小权重越大）
+        ce_losses = torch.stack(ce_losses, dim=1)  # [B, K]
+        # 取负号使损失越小对应的权重越大，然后softmax
+        retrieval_probs = F.softmax(-ce_losses / self.retrieval_tau, dim=1)  # [B, K]
+        
+        return retrieval_probs
 
     def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
         """计算注意力评分 - 使用nn.MultiheadAttention提取注意力权重"""
@@ -342,16 +282,18 @@ class TTARArec(SequentialRecommender):
         return attn_weights
 
     def compute_kl_loss(self, attention_probs, retrieval_probs):
-        """计算注意力分布与检索分布之间的KL散度损失 - 使用PyTorch库函数"""
+        """
+        通过KL散度让attention融合层学习compute_retrieval_scores得到的分数
+        KL(attention_probs || retrieval_probs) - attention向retrieval对齐
+        """
         # 确保两个分布的维度完全匹配
         assert attention_probs.shape == retrieval_probs.shape, \
             f"形状不匹配: attention_probs {attention_probs.shape} vs retrieval_probs {retrieval_probs.shape}"
         
-        # 使用PyTorch的kl_div函数，更数值稳定
-        # kl_div接受log概率作为第一个参数，目标分布作为第二个参数
-        # KL(attention_probs || retrieval_probs)
-        log_retrieval_probs = torch.log(retrieval_probs + 1e-8)
-        kl_div = F.kl_div(log_retrieval_probs, attention_probs, reduction='batchmean')
+        # 使用PyTorch的kl_div函数，让attention分布向retrieval分布学习
+        # KL(attention || retrieval): attention作为学习目标，retrieval作为教师信号
+        log_attention_probs = torch.log(attention_probs + 1e-8)
+        kl_div = F.kl_div(log_attention_probs, retrieval_probs, reduction='batchmean')
         
         return kl_div
 
@@ -373,90 +315,24 @@ class TTARArec(SequentialRecommender):
             topk=self.topk
         )
 
-        # 一次性计算增强序列表征，供后续复用
-        enhanced_sequences = self.compute_enhanced_sequences(
-            retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
-        )
-
-        # 使用预计算的增强序列表征进行序列增强
-        seq_output_aug = self.seq_augmented(
-            seq_output, batch_user_id, batch_seq_len, 
-            enhanced_sequences=enhanced_sequences
-        )
+        # 新的训练流程：不需要增强序列表征，直接使用检索序列
             
-        # 计算推荐损失（支持CE/BPR）
-        if self.loss_type == 'BPR':
-            # 标准BPR：统一使用 RecBole 的 BPRLoss；
-            # 负样本来源：
-            # - 优先从数据管线 interaction 读取 NEG_ITEM_ID（推荐）
-            # - 可选启用硬负采样，仅用于“选负样本”，损失依旧走 BPRLoss
-            pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
-            if getattr(self, 'bpr_hard_negatives', False):
-                # 硬负样本选择
-                all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
-                scores_full = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]
-                batch_idx = torch.arange(scores_full.size(0), device=scores_full.device)
-                scores_full[batch_idx, pos_items] = -1e9  # 屏蔽正样本
-                k = int(getattr(self, 'bpr_num_negatives', 1))
-                k = max(1, min(k, scores_full.size(1) - 1))
-                _, neg_idx = torch.topk(scores_full, k=k, dim=1, largest=True)  # [B, K]
-                neg_items_emb = all_items_emb[neg_idx]  # [B, K, H]
-                # 分数
-                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-                neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, K]
-                # 展平为标准 BPRLoss 输入
-                rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
-            else:
-                # 管线负采样（标准做法）
-                neg_items = interaction[self.NEG_ITEM_ID]
-                neg_items_emb = self.get_item_embedding(neg_items)  # [B, H] 或 [B, n_neg, H]
-                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-                if neg_items_emb.dim() == 2:
-                    neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
-                    rec_loss = self.loss_fct(pos_score, neg_score)
-                else:
-                    neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, n_neg]
-                    rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
-        else:
-            # 默认回退CE
-            test_item_emb = self.pretrained_model.item_embedding.weight
-            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
-            rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
+        # 计算主要的推荐损失（基于原始序列）
+        all_items_emb = self.pretrained_model.item_embedding.weight
+        logits = torch.matmul(seq_output, all_items_emb.transpose(0, 1))
+        rec_loss = self.loss_fct(logits, pos_items)
 
-        # 计算检索评分：使用预计算的增强序列表征
-        neg_items_for_ret = interaction[self.NEG_ITEM_ID]
-        retrieval_probs = self.compute_retrieval_scores(
-            retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
-            enhanced_sequences=enhanced_sequences, query_output=seq_output_aug, neg_items=neg_items_for_ret
-        )  # [B, K]
+        # 计算检索评分（基于熵加权融合的CE损失概率权重）
+        retrieval_probs = self.compute_retrieval_scores(seq_output, retrieved_seqs, pos_items)  # [B, K]
         
-        # 计算注意力评分：使用增强序列表征
+        # 计算注意力评分
         attention_probs = self.compute_attention_scores(
-            seq_output, None, None, enhanced_sequences=enhanced_sequences
+            seq_output, retrieved_seqs, retrieved_seqs
         )  # [B, K]
         
         # 计算KL散度损失（注意力评分向检索评分对齐）
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
 
-        # ============ 诊断信息输出 ============
-        # 每33个batch输出一次诊断信息
-        if hasattr(self, 'batch_count'):
-            self.batch_count += 1
-        else:
-            self.batch_count = 0
-            
-        if self.batch_count % 129 == 0:
-            # 计算检索效果指标
-            retrieval_effectiveness, augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency = compute_retrieval_effectiveness_vectorized(self,
-                retrieved_item_seqs, pos_items, item_seq, item_seq_len, batch_seq_len, retrieved_seqs, retrieved_tar_items, enhanced_sequences
-            )
-            
-            print_diagnostic_info_optimized(self,
-                rec_loss, kl_loss, retrieval_probs, attention_probs, 
-                seq_output, seq_output_aug, pos_items, retrieval_effectiveness, 
-                augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency,
-            )
-        
         # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
         total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         
@@ -713,28 +589,34 @@ class TTARArec(SequentialRecommender):
         """启用检索增强功能"""
         self.use_retrieval = True
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", pos_items=None, enhanced_sequences=None, item_seq=None, item_seq_len=None):
-        """序列增强 - 使用训练后的交叉注意力层进行索引融合"""
-        # 如果已有增强序列表征，直接使用；否则计算
-        if enhanced_sequences is not None:
-            # 直接使用预计算的增强序列表征
-            retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
-        else:
-            # 检索相似序列和目标物品ID
-            retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
-                seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
-            )
-            # 若能提供原始序列与长度，则计算增强序列表征；否则回退到原有K/V（retrieved_seqs/retrieved_tar_items）
-            if (item_seq is not None) and (item_seq_len is not None):
-                enhanced_sequences = self.compute_enhanced_sequences(
-                    retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
-                )
-                retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
+    def inference_augmentation(self, seq_output, batch_user_id, batch_seq_len, mode="test"):
+        """
+        推理增强：基于熵的动态融合
+        1. 输入序列得到logits1
+        2. attention融合检索序列得到融合序列表征
+        3. 融合序列表征得到logits2
+        4. 基于两个logits的熵计算α，最终融合为flogits
+        """
+        # 检索相似序列
+        retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
+            seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
+        )
         
-        # 与原始序列表征进行加权融合
-        augmented_output = seq_output * self.fusion_weight + retrieval_enhanced_output * (1 - self.fusion_weight)
+        all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
         
-        return augmented_output
+        # 1. 原始序列对全物品集打分
+        logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]
+        
+        # 2. 通过attention融合层融合检索到的K个序列
+        fusion_output = self.fusion_forward(seq_output, retrieved_seqs)  # [B, H]
+        
+        # 3. 融合序列表征对全物品集打分
+        logits2 = torch.matmul(fusion_output, all_items_emb.transpose(0, 1))  # [B, N]
+        
+        # 4. 基于熵计算α，融合得到最终logits
+        final_logits = self.entropy_weighted_fusion(logits1, logits2)  # [B, N]
+        
+        return final_logits
 
     def predict(self, interaction):
         """预测单个物品的得分"""
@@ -747,23 +629,25 @@ class TTARArec(SequentialRecommender):
         return scores
 
     def full_sort_predict(self, interaction):
-        """全排序预测 - 根据训练状态决定是否使用检索增强"""
+        """全排序预测 - 使用新的推理增强机制"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
         
-        # 根据训练状态决定是否使用检索增强
+        # 根据训练状态决定是否使用推理增强
         if self.use_retrieval:
             batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
             batch_seq_len = item_seq_len.detach().cpu().numpy()
-            seq_output = self.seq_augmented(
-                seq_output, batch_user_id, batch_seq_len, mode="test",
-                item_seq=item_seq, item_seq_len=item_seq_len
+            # 使用新的推理增强，基于熵加权融合
+            final_logits = self.inference_augmentation(
+                seq_output, batch_user_id, batch_seq_len, mode="test"
             )
+            scores = final_logits
+        else:
+            # 不使用检索时，直接用原始序列
+            test_items_emb = self.pretrained_model.item_embedding.weight
+            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
         
-        # 计算与所有物品的得分
-        test_items_emb = self.pretrained_model.item_embedding.weight
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
         if self.final_test_mode:
             with torch.no_grad():
                 topk = min(self.final_test_topk, scores.size(1))
