@@ -74,12 +74,8 @@ class TTARArec(SequentialRecommender):
         
         # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
-        self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
         self.retrieval_tau = config['retrieval_tau'] if 'retrieval_tau' in config else 1.0
 
-        # 测试阶段输出Top-K推荐结果控制（仅最终测试使用）
-        self.final_test_mode = False
-        self.final_test_topk = 30
         # ========== 5. 构建检索器和融合组件 ==========
         self._build_fusion_components(config)
 
@@ -658,13 +654,4 @@ class TTARArec(SequentialRecommender):
             test_items_emb = self.pretrained_model.item_embedding.weight
             scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
         
-        if self.final_test_mode:
-            with torch.no_grad():
-                topk = min(self.final_test_topk, scores.size(1))
-                _, top_indices = torch.topk(scores, k=topk, dim=1)
-                top_indices_cpu = top_indices.detach().cpu().numpy()
-                for i in range(top_indices_cpu.shape[0]):
-                    print(f"[Final-Test-Top{topk}] Sample {i} -> items: {top_indices_cpu[i].tolist()}")
-        
         return scores
-
