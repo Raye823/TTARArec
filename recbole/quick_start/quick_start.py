@@ -126,6 +126,8 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
     plt.savefig(log_dir + '/svs.pdf', format='pdf', transparent=False, bbox_inches='tight')
 
     # model evaluation
+    if config['model'] == 'RaSeRec':
+        model.precached_knowledge_val(valid_data)
     test_result = trainer.evaluate(test_data, load_best_model=saved, show_progress=config['show_progress'])
 
     logger.info(set_color('best valid ', 'yellow') + f': {best_valid_result}')

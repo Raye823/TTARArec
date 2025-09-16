@@ -272,10 +272,10 @@ class SequentialNegSampleDataLoader(NegSampleByMixin, SequentialDataLoader):
     """
 
     def __init__(
-        self, config, dataset, sampler, neg_sample_args, batch_size=1, dl_format=InputType.POINTWISE, shuffle=False
+        self, config, dataset, sampler, neg_sample_args, batch_size=1, dl_format=InputType.POINTWISE, shuffle=False, phase='train'
     ):
         super().__init__(
-            config, dataset, sampler, neg_sample_args, batch_size=batch_size, dl_format=dl_format, shuffle=shuffle
+            config, dataset, sampler, neg_sample_args, batch_size=batch_size, dl_format=dl_format, shuffle=shuffle, phase=phase
         )
 
     def _batch_size_adaptation(self):
