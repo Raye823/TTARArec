@@ -52,7 +52,7 @@ class SequentialDataset(Dataset):
         For other models: Original augmentation strategy.
         """
         # 检查是否为TTARArec模型
-        model_name = self.config.get('model', '').lower()
+        model_name = self.config['model'].lower()
         use_ttararec_augmentation = (model_name == 'ttararec')
         
         if use_ttararec_augmentation:
@@ -63,39 +63,52 @@ class SequentialDataset(Dataset):
             self._prepare_original_augmentation()
 
     def _prepare_ttararec_augmentation(self):
-        """TTARArec专用的数据增强策略：每用户只生成最后3个样本"""
+        """TTARArec专用的数据增强策略：使用滑动窗口生成所有样本，然后只保留最后3个"""
         self._check_field('uid_field', 'time_field')
         max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']
         self.sort(by=[self.uid_field, self.time_field], ascending=True)
         
-        # 获取每个用户的交互序列
-        user_interactions = {}
-        for i, uid in enumerate(self.inter_feat[self.uid_field].numpy()):
-            if uid not in user_interactions:
-                user_interactions[uid] = []
-            user_interactions[uid].append(i)
+        # 使用与原始实现相同的滑动窗口策略生成所有样本
+        last_uid = None
+        all_samples = []  # 存储所有样本
+        seq_start = 0
         
+        for i, uid in enumerate(self.inter_feat[self.uid_field].numpy()):
+            if last_uid != uid:
+                last_uid = uid
+                seq_start = i
+            else:
+                # 使用滑动窗口，与原始实现完全一致
+                if i - seq_start > max_item_list_len:
+                    seq_start += 1
+                
+                # 记录样本信息
+                all_samples.append({
+                    'uid': uid,
+                    'item_list_index': slice(seq_start, i),
+                    'target_index': i,
+                    'item_list_length': i - seq_start
+                })
+        
+        # 按用户分组，为每个用户只保留最后3个样本
+        user_samples = {}
+        for sample in all_samples:
+            uid = sample['uid']
+            if uid not in user_samples:
+                user_samples[uid] = []
+            user_samples[uid].append(sample)
+        
+        # 为每个用户选择最后3个样本
         uid_list, item_list_index, target_index, item_list_length = [], [], [], []
         
-        # 为每个用户只生成最后3个样本
-        for uid, interactions in user_interactions.items():
-            if len(interactions) >= 4:  # 至少需要4个交互才能产生3个样本
-                # 限制序列长度，确保最长历史序列不超过max_item_list_len
-                if len(interactions) > max_item_list_len + 1:
-                    interactions = interactions[-(max_item_list_len + 1):]
-                
-                total_len = len(interactions)
-                # 只生成最后3个样本：倒数第3、2、1个
-                for i in range(3):
-                    target_pos = total_len - 3 + i  # 倒数第3、2、1个位置
-                    history_end = target_pos - 1    # 历史序列结束位置
-                    
-                    # 确保历史序列长度不超过限制
-                    if history_end >= 0 and history_end + 1 <= max_item_list_len:
-                        uid_list.append(uid)
-                        item_list_index.append(slice(interactions[0], interactions[history_end] + 1))
-                        target_index.append(interactions[target_pos])
-                        item_list_length.append(history_end + 1)
+        for uid, samples in user_samples.items():
+            # 直接选择最后3个样本，与原始实现保持一致
+            last_three_samples = samples[-3:] if len(samples) >= 3 else samples
+            for sample in last_three_samples:
+                uid_list.append(sample['uid'])
+                item_list_index.append(sample['item_list_index'])
+                target_index.append(sample['target_index'])
+                item_list_length.append(sample['item_list_length'])
 
         self.uid_list = np.array(uid_list)
         self.item_list_index = np.array(item_list_index)
