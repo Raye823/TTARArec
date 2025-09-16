@@ -324,31 +324,3 @@ def print_diagnostic_info_optimized(model, rec_loss, kl_loss, retrieval_probs, a
         logger.info(f"融合权重最高索引与表征相似度最高索引一致性: {fusion_retrieval_consistency:.6f} ({fusion_retrieval_consistency*100:.2f}%)")
         logger.info(f"最佳增强效果索引与融合权重最高索引一致性: {augment_fusion_consistency:.6f} ({augment_fusion_consistency*100:.2f}%)")
         logger.info(f"========================================\n")
-
-
-def get_attention_grad_norms(model):
-    """极简版：按 in_proj_* 切片输出 Q/K/V 以及 out_proj 的梯度范数。"""
-    norms = {}
-    attn = getattr(model, 'cross_attn', None)
-    if attn is None or getattr(attn, 'in_proj_weight', None) is None or getattr(attn, 'in_proj_bias', None) is None:
-        return norms
-    d = attn.embed_dim
-    # Q/K/V 权重
-    if attn.in_proj_weight.grad is not None:
-        w = attn.in_proj_weight.grad
-        norms['cross_attn.q_proj.weight'] = w[:d, :].norm().item()
-        norms['cross_attn.k_proj.weight'] = w[d:2*d, :].norm().item()
-        norms['cross_attn.v_proj.weight'] = w[2*d:3*d, :].norm().item()
-    # Q/K/V 偏置
-    if attn.in_proj_bias.grad is not None:
-        b = attn.in_proj_bias.grad
-        norms['cross_attn.q_proj.bias'] = b[:d].norm().item()
-        norms['cross_attn.k_proj.bias'] = b[d:2*d].norm().item()
-        norms['cross_attn.v_proj.bias'] = b[2*d:3*d].norm().item()
-    # 输出投影
-    if attn.out_proj is not None:
-        if attn.out_proj.weight is not None and attn.out_proj.weight.grad is not None:
-            norms['cross_attn.out_proj.weight'] = attn.out_proj.weight.grad.norm().item()
-        if attn.out_proj.bias is not None and attn.out_proj.bias.grad is not None:
-            norms['cross_attn.out_proj.bias'] = attn.out_proj.bias.grad.norm().item()
-    return norms 

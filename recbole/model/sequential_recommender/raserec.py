@@ -13,15 +13,15 @@ Reference:
 Reference:
     https://github.com/kang205/SASRec
 
-""" 
-import torch, heapq, scipy, faiss, random, math
+"""
+
+import torch, heapq, scipy, faiss, random
 from faiss import normalize_L2
 from torch import nn
 import numpy as np
 from recbole.model.abstract_recommender import SequentialRecommender
-from recbole.model.layers import TransformerEncoder, CrossMultiHeadAttention, FeedForward, activation_layer, MLPLayers, MultiHeadAttention
+from recbole.model.layers import TransformerEncoder, CrossMultiHeadAttention, FeedForward, activation_layer, MLPLayers
 from recbole.model.loss import BPRLoss
-import torch.nn.functional as F
 
 
 class RaSeRec(SequentialRecommender):
@@ -41,9 +41,12 @@ class RaSeRec(SequentialRecommender):
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.nprobe = config['nprobe']
+        self.dropout_rate = config['dropout_rate']
         self.topk = config['top_k']
         self.alpha = config['alpha']
-        self.low_popular = config['low_popular'] if 'low_popular' in config else 100
+        self.low_popular = 100
+        self.beta = config['beta']
+        self.attn_tau = config['attn_tau']
         self.n_layers = config['n_layers']
         self.n_heads = config['n_heads']
         self.hidden_size = config['hidden_size']  # same as embedding_size
@@ -53,20 +56,14 @@ class RaSeRec(SequentialRecommender):
         self.hidden_act = config['hidden_act']
         self.layer_norm_eps = config['layer_norm_eps']
 
-        # RetrieverEncoder相关参数
-        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 1
-        self.retriever_temperature = config['retriever_temperature'] if 'retriever_temperature' in config else 0.1
-        self.recommendation_temperature = config['recommendation_temperature'] if 'recommendation_temperature' in config else 0.1
-        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0.1
-        self.kl_weight = config['kl_weight'] if 'kl_weight' in config else 0.1
-
         self.initializer_range = config['initializer_range']
         self.loss_type = config['loss_type']
 
         # define layers and loss
         self.item_embedding = nn.Embedding(self.n_items, self.hidden_size, padding_idx=0)
         self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
-        
+        self.hidden_dropout_prob = 0.0
+        self.attn_dropout_prob = 0.0
         self.trm_encoder = TransformerEncoder(
             n_layers=self.n_layers,
             n_heads=self.n_heads,
@@ -78,22 +75,6 @@ class RaSeRec(SequentialRecommender):
             layer_norm_eps=self.layer_norm_eps
         )
 
-        # 检索器编码器 - 简单MLP架构
-        self.retriever_mlp = nn.ModuleList()
-        self.retriever_layer_norms = nn.ModuleList()
-        
-        for i in range(self.retriever_layers):
-            self.retriever_mlp.append(
-                nn.Linear(self.hidden_size, self.hidden_size)
-            )
-            self.retriever_layer_norms.append(
-                nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
-            )
-        
-        # 残差连接和激活函数
-        self.retriever_act_fn = activation_layer(self.hidden_act)
-        self.retriever_dropout_layer = nn.Dropout(self.retriever_dropout)
-
         self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
         self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
@@ -104,69 +85,105 @@ class RaSeRec(SequentialRecommender):
         else:
             raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
 
+        self.tau = config['tau']
+        self.sim = config['sim']
+        self.batch_size = config['train_batch_size']
+        self.mask_default = self.mask_correlated_samples(batch_size=self.batch_size)
+        self.aug_nce_fct = nn.CrossEntropyLoss()
+        self.sem_aug_nce_fct = nn.CrossEntropyLoss()
+
         # parameters initialization
         self.apply(self._init_weights)
         # precached knowledge
         self.dataset = dataset
         
-        # 加载预训练融合模块参数
-        pretrained_path = config['pretrained_path']
-        if pretrained_path:
-            self._load_pretrained_weights(pretrained_path)
-        
-        # 冻结除检索器编码器以外的所有参数
-        self._freeze_parameters()
-
-    def _load_pretrained_weights(self, pretrained_path):
-        """加载预训练模型参数"""
-        try:
-            print(f"正在加载预训练模型参数: {pretrained_path}")
-            checkpoint = torch.load(pretrained_path, map_location='cuda' if torch.cuda.is_available() else 'cpu')
+        # 调试相关属性
+        self.batch_count = 129
+        self.debug_enabled = config['debug_enabled'] if 'debug_enabled' in config else True
+    
+    def print_diagnostic_info_raserec(self, seq_output, seq_output_aug, pos_items, attention_probs):
+        """RaSeRec 专用的调试信息输出"""
+        if not self.debug_enabled:
+            return
             
-            # 如果checkpoint是字典且包含state_dict
-            if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
-                pretrained_state_dict = checkpoint['state_dict']
+        with torch.no_grad():
+            # 批量计算所有GPU指标，最后一次性传输到CPU
+            gpu_metrics = {}
+            
+            # 注意力评分分析
+            gpu_metrics['attention_std'] = attention_probs.std()
+            gpu_metrics['attention_entropy'] = -torch.sum(attention_probs * torch.log(attention_probs + 1e-8), dim=-1).mean()
+            
+            # 增强效果分析
+            gpu_metrics['seq_similarity'] = torch.cosine_similarity(seq_output, seq_output_aug, dim=-1).mean()
+            pos_items_emb = self.item_embedding(pos_items)
+            gpu_metrics['original_sim'] = torch.sum(seq_output * pos_items_emb, dim=-1).mean()
+            gpu_metrics['augmented_sim'] = torch.sum(seq_output_aug * pos_items_emb, dim=-1).mean()
+            gpu_metrics['sim_improvement'] = gpu_metrics['augmented_sim'] - gpu_metrics['original_sim']
+            
+            # 排序间隔指标（完全在GPU上计算）
+            test_item_emb = self.item_embedding.weight  # [n_items, H]
+            batch_size_local = seq_output.size(0)
+            batch_indices = torch.arange(batch_size_local, device=seq_output.device)
+            
+            # 原始与增强的全物品打分
+            original_logits_full = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B, N]
+            augmented_logits_full = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))  # [B, N]
+            
+            # 正样本分数
+            pos_scores_original = original_logits_full[batch_indices, pos_items]
+            pos_scores_augmented = augmented_logits_full[batch_indices, pos_items]
+            
+            # 负样本屏蔽（将正样本位置置为极小值）
+            original_logits_masked = original_logits_full.clone()
+            original_logits_masked[batch_indices, pos_items] = -1e9
+            augmented_logits_masked = augmented_logits_full.clone()
+            augmented_logits_masked[batch_indices, pos_items] = -1e9
+            
+            # Top-1负样本
+            top1_neg_original = torch.max(original_logits_masked, dim=1).values
+            top1_neg_augmented = torch.max(augmented_logits_masked, dim=1).values
+            
+            # 间隔（Top-1负样本）
+            gpu_metrics['original_margin_top1'] = (pos_scores_original - top1_neg_original).mean()
+            gpu_metrics['augmented_margin_top1'] = (pos_scores_augmented - top1_neg_augmented).mean()
+            gpu_metrics['margin_top1_improvement'] = gpu_metrics['augmented_margin_top1'] - gpu_metrics['original_margin_top1']
+            
+            # Top-10负样本均值间隔（可选）
+            topk = 10 if augmented_logits_masked.size(1) >= 10 else max(1, int(augmented_logits_masked.size(1) // 100))
+            if topk > 1:
+                topk_neg_original = torch.topk(original_logits_masked, k=topk, dim=1).values.mean(dim=1)
+                topk_neg_augmented = torch.topk(augmented_logits_masked, k=topk, dim=1).values.mean(dim=1)
+                gpu_metrics['original_margin_topk'] = (pos_scores_original - topk_neg_original).mean()
+                gpu_metrics['augmented_margin_topk'] = (pos_scores_augmented - topk_neg_augmented).mean()
+                gpu_metrics['margin_topk_improvement'] = gpu_metrics['augmented_margin_topk'] - gpu_metrics['original_margin_topk']
             else:
-                pretrained_state_dict = checkpoint
+                gpu_metrics['original_margin_topk'] = gpu_metrics['original_margin_top1']
+                gpu_metrics['augmented_margin_topk'] = gpu_metrics['augmented_margin_top1']
+                gpu_metrics['margin_topk_improvement'] = gpu_metrics['margin_top1_improvement']
             
-            # 过滤掉不存在的参数键（例如被移除的交叉注意力相关参数）
-            current_state_dict = self.state_dict()
-            filtered_state_dict = {k: v for k, v in pretrained_state_dict.items() if k in current_state_dict}
+            # 一次性将所有GPU指标传输到CPU
+            cpu_metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in gpu_metrics.items()}
             
-            # 加载预训练参数
-            missing_keys, unexpected_keys = self.load_state_dict(filtered_state_dict, strict=False)
+            # 输出结果
+            print(f"\n========== RaSeRec 诊断信息 (Batch {self.batch_count}) ==========")
             
-            print(f"成功加载预训练模型参数!")
-            print(f"缺失的参数键: {missing_keys}")
-            print(f"多余的参数键: {unexpected_keys}")
-        except Exception as e:
-            print(f"加载预训练模型参数失败: {e}")
-
-    def _freeze_parameters(self):
-        """冻结除检索器编码器以外的所有参数"""
-        # 首先冻结所有参数
-        for name, param in self.named_parameters():
-            param.requires_grad = False
-        
-        # 然后只解冻检索器编码器的参数
-        for name, param in self.retriever_mlp.named_parameters():
-            param.requires_grad = True
-        
-        for name, param in self.retriever_layer_norms.named_parameters():
-            param.requires_grad = True
-        
-        # 统计并打印
-        frozen_count = 0
-        trainable_count = 0
-        
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                trainable_count += 1
-                print(f"可训练参数: {name}")
-            else:
-                frozen_count += 1
+            print(f"\n--- 注意力评分分布 ---")
+            print(f"注意力评分标准差: {cpu_metrics['attention_std']:.6f}")
+            print(f"注意力评分熵: {cpu_metrics['attention_entropy']:.6f}")
             
-        print(f"已冻结 {frozen_count} 个参数，保留 {trainable_count} 个可训练参数")
+            print(f"\n--- 增强效果 ---")
+            print(f"原始序列与增强序列相似度: {cpu_metrics['seq_similarity']:.6f}")
+            print(f"原始序列与目标项相似度: {cpu_metrics['original_sim']:.6f}")
+            print(f"增强序列与目标项相似度: {cpu_metrics['augmented_sim']:.6f}")
+            print(f"增强带来的相似度提升: {cpu_metrics['sim_improvement']:.6f}")
+            print(f"原始序列Top-1负样本间隔: {cpu_metrics['original_margin_top1']:.6f}")
+            print(f"增强序列Top-1负样本间隔: {cpu_metrics['augmented_margin_top1']:.6f}")
+            print(f"Top-1间隔提升: {cpu_metrics['margin_top1_improvement']:.6f}")
+            print(f"原始序列Top-10均值负样本间隔: {cpu_metrics['original_margin_topk']:.6f}")
+            print(f"增强序列Top-10均值负样本间隔: {cpu_metrics['augmented_margin_topk']:.6f}")
+            print(f"Top-10间隔提升: {cpu_metrics['margin_topk_improvement']:.6f}")
+            print(f"========================================\n")
 
     def precached_knowledge(self):
         length_threshold = 1
@@ -221,7 +238,7 @@ class RaSeRec(SequentialRecommender):
         self.seq_emb_knowledge = seq_emb_knowledge
         self.tar_emb_knowledge = tar_emb_knowledge
         # faiss
-        d = self.hidden_size
+        d = 64  
         nlist = 128
         seq_emb_knowledge_copy = np.array(seq_emb_knowledge, copy=True)
         normalize_L2(seq_emb_knowledge_copy)
@@ -313,7 +330,7 @@ class RaSeRec(SequentialRecommender):
         self.seq_emb_knowledge = seq_emb_knowledge
         self.tar_emb_knowledge = tar_emb_knowledge
         # faiss
-        d = self.hidden_size  
+        d = 64  
         nlist = 128
         seq_emb_knowledge_copy = np.array(seq_emb_knowledge, copy=True)
         normalize_L2(seq_emb_knowledge_copy)
@@ -330,6 +347,52 @@ class RaSeRec(SequentialRecommender):
         self.tar_emb_index.train(tar_emb_knowledge_copy)
         self.tar_emb_index.add(tar_emb_knowledge_copy) 
         self.tar_emb_index.nprobe=self.nprobe
+    
+    
+    def presetting_ram(self):
+        dropout_rate = self.dropout_rate
+        n_heads = self.n_heads
+        self.seq_tar_ram = CrossMultiHeadAttention(
+            n_heads=n_heads,
+            hidden_size=self.hidden_size,
+            hidden_dropout_prob=dropout_rate,
+            attn_dropout_prob=dropout_rate,
+            layer_norm_eps=self.layer_norm_eps,
+            attn_tau=self.attn_tau
+        ).to("cuda")
+        self.seq_tar_ram_1 = CrossMultiHeadAttention(
+            n_heads=n_heads,
+            hidden_size=self.hidden_size,
+            hidden_dropout_prob=dropout_rate,
+            attn_dropout_prob=dropout_rate,
+            layer_norm_eps=self.layer_norm_eps,
+            attn_tau=self.attn_tau
+        ).to("cuda")
+        self.seq_tar_ram_fnn = FeedForward(self.hidden_size, self.inner_size, dropout_rate, self.hidden_act, self.layer_norm_eps).to("cuda")
+
+
+        self.tar_seq_ram = CrossMultiHeadAttention(
+            n_heads=n_heads,
+            hidden_size=self.hidden_size,
+            hidden_dropout_prob=dropout_rate,
+            attn_dropout_prob=dropout_rate,
+            layer_norm_eps=self.layer_norm_eps,
+            attn_tau=self.attn_tau
+        ).to("cuda")
+        self.tar_seq_ram_1 = CrossMultiHeadAttention(
+            n_heads=n_heads,
+            hidden_size=self.hidden_size,
+            hidden_dropout_prob=dropout_rate,
+            attn_dropout_prob=dropout_rate,
+            layer_norm_eps=self.layer_norm_eps,
+            attn_tau=self.attn_tau
+        ).to("cuda")
+        self.tar_seq_ram_fnn = FeedForward(self.hidden_size, self.inner_size, dropout_rate, self.hidden_act, self.layer_norm_eps).to("cuda")
+       
+        self.seq_tar_ram_position_embedding_retrieval = nn.Embedding(self.topk, self.hidden_size).to("cuda")
+
+        self.tar_seq_ram_position_embedding_retrieval = nn.Embedding(self.topk, self.hidden_size).to("cuda")
+
 
     def _init_weights(self, module):
         """ Initialize the weights """
@@ -395,27 +458,40 @@ class RaSeRec(SequentialRecommender):
         trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
         output = trm_output[-1]
         output = self.gather_indexes(output, item_seq_len - 1)
-        return output  # [B H]
+        #return output  # [B H]
+        return output.requires_grad_(True)  # 确保输出需要梯度
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
-        """使用目标嵌入进行序列增强"""
-        # 直接使用原始序列表示进行检索
-        retrieved_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_tars2 = self.retrieve_seq_tar(seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode)
+    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", return_attention=False):
+        torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, torch_retrieval_seq_embs2, torch_retrieval_tar_embs2 = self.retrieve_seq_tar(seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode)
 
-        # 使用检索器编码器调整原始序列表示
-        retriever_encoded_seq = self.retriever_forward(seq_output)
+        # augmentation
+        if return_attention:
+            seq_output_saug, attn_weights_1 = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, return_attention=True)
+            seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
+            seq_output_saug, attn_weights_2 = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, return_attention=True) 
+            seq_output_taug, attn_weights_3 = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2, return_attention=True)
+            seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
+            seq_output_taug, attn_weights_4 = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2, return_attention=True)
+            # 合并注意力权重
+            combined_attention_weights = (attn_weights_1 + attn_weights_2 + attn_weights_3 + attn_weights_4) / 4.0
+        else:
+            seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
+            seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
+            seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1) 
+            seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
+            seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
+            seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
         
-        # 计算检索器编码后序列与相似序列的相似度作为权重
-        similarities = torch.sum(retriever_encoded_seq.unsqueeze(1) * retrieved_seqs1, dim=-1)  # [B, K]
-        weights = torch.softmax(similarities, dim=-1)  # [B, K]
-        
-        # 使用权重来融合对应的目标嵌入
-        weighted_retrieved = torch.sum(weights.unsqueeze(-1) * retrieved_tars1, dim=1)  # [B, H]
-        
-        # 与原始序列进行加权组合（注意：这里仍然用原始序列，不是编码后的）
         alpha = self.alpha
-        seq_output = alpha * seq_output + (1 - alpha) * weighted_retrieved
-        return seq_output
+        beta = self.beta
+
+        # output
+        seq_output_final = alpha*seq_output+(1-alpha)*(beta*seq_output_saug+(1-beta)*seq_output_taug)
+        
+        if return_attention:
+            return seq_output_final, combined_attention_weights
+        else:
+            return seq_output_final
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
@@ -425,31 +501,99 @@ class RaSeRec(SequentialRecommender):
         batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
         
-        # 直接使用原始序列表示进行检索，不使用检索器编码器
-        retrieved_seqs1, retrieved_tars1, retrieved_seqs2, retrieved_tars2 = self.retrieve_seq_tar(
-            seq_output,  # 直接使用原始序列表示
-            batch_user_id, 
-            batch_seq_len,
-            topk=self.topk
-        )
+        # aug - 获取注意力权重用于调试
+        if self.debug_enabled:
+            seq_output_aug, attention_probs = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, return_attention=True)
+        else:
+            seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
+            attention_probs = None
+            
+        seq_output_aug = torch.where((item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, 64), seq_output, seq_output_aug)
         
-        # 计算检索分布：基于检索序列与目标项的点积相似度
-        retrieval_probs = self.compute_retrieval_scores(
-            seq_output, retrieved_seqs1, retrieved_tars1, pos_items
-        ) # [B, K]
+        if self.loss_type == 'BPR':
+            neg_items = interaction[self.NEG_ITEM_ID]
+            pos_items_emb = self.item_embedding(pos_items)
+            neg_items_emb = self.item_embedding(neg_items)
+            pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
+            neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
+            loss = self.loss_fct(pos_score, neg_score)
+        else:  # self.loss_type = 'CE'
+            #test_item_emb = self.item_embedding.weight
+            test_item_emb = self.item_embedding.weight  # 确保嵌入需要梯度
+            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
+            loss = self.loss_fct(logits, pos_items)
+
+        # 调试信息输出
+        if self.debug_enabled and attention_probs is not None:
+            self.batch_count += 1
+            if self.batch_count % 129 == 0:
+                self.print_diagnostic_info_raserec(seq_output, seq_output_aug, pos_items, attention_probs)
+
+        return loss
+
+    def mask_correlated_samples(self, batch_size):
+        N = 2 * batch_size
+        mask = torch.ones((N, N), dtype=bool)
+        mask = mask.fill_diagonal_(0)
+        for i in range(batch_size):
+            mask[i, batch_size + i] = 0
+            mask[batch_size + i, i] = 0
+        return mask
+
+    def info_nce(self, z_i, z_j, temp, batch_size, sim='dot'):
+        """
+        We do not sample negative examples explicitly.
+        Instead, given a positive pair, similar to (Chen et al., 2017), we treat the other 2(N − 1) augmented examples within a minibatch as negative examples.
+        """
+        N = 2 * batch_size
+    
+        z = torch.cat((z_i, z_j), dim=0)
+    
+        if sim == 'cos':
+            sim = nn.functional.cosine_similarity(z.unsqueeze(1), z.unsqueeze(0), dim=2) / temp
+        elif sim == 'dot':
+            sim = torch.mm(z, z.T) / temp
+    
+        sim_i_j = torch.diag(sim, batch_size)
+        sim_j_i = torch.diag(sim, -batch_size)
+    
+        positive_samples = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
+        if batch_size != self.batch_size:
+            mask = self.mask_correlated_samples(batch_size)
+        else:
+            mask = self.mask_default
+        negative_samples = sim[mask].reshape(N, -1)
+    
+        labels = torch.zeros(N).to(positive_samples.device).long()
+        logits = torch.cat((positive_samples, negative_samples), dim=1)
+        return logits, labels
+
+    def decompose(self, z_i, z_j, origin_z, batch_size):
+        """
+        We do not sample negative examples explicitly.
+        Instead, given a positive pair, similar to (Chen et al., 2017), we treat the other 2(N − 1) augmented examples within a minibatch as negative examples.
+        """
+        N = 2 * batch_size
+    
+        z = torch.cat((z_i, z_j), dim=0)
+    
+        # pairwise l2 distace
+        sim = torch.cdist(z, z, p=2)
+    
+        sim_i_j = torch.diag(sim, batch_size)
+        sim_j_i = torch.diag(sim, -batch_size)
+    
+        positive_samples = torch.cat((sim_i_j, sim_j_i), dim=0).reshape(N, 1)
+        alignment = positive_samples.mean()
+
+        # pairwise l2 distace
+        sim = torch.cdist(origin_z, origin_z, p=2)
+        mask = torch.ones((batch_size, batch_size), dtype=bool)
+        mask = mask.fill_diagonal_(0)
+        negative_samples = sim[mask].reshape(batch_size, -1)
+        uniformity = torch.log(torch.exp(-2 * negative_samples).mean())
         
-        # 计算推荐分布：基于原序列与检索序列的点积相似度
-        recommendation_probs = self.compute_recommendation_scores(
-            seq_output, retrieved_seqs2, retrieved_tars2
-        ) # [B, K]
-        
-        # 计算KL散度损失
-        kl_loss = self.compute_kl_loss(retrieval_probs, recommendation_probs)
-        
-        # 总损失 = KL散度损失 * 权重
-        total_loss = self.kl_weight * kl_loss
-        
-        return total_loss
+        return alignment, uniformity
     
     def predict(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
@@ -460,11 +604,10 @@ class RaSeRec(SequentialRecommender):
         scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
         return scores
 
-    def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
-        """检索相似序列和对应的目标嵌入"""
-        queries_cpu = queries.detach().cpu().numpy()
-        normalize_L2(queries_cpu)
-        _, I1 = self.seq_emb_index.search(queries_cpu, 4*topk)
+    def retrieve_seq_tar(self, qeuries, batch_user_id, batch_seq_len, topk=5, mode="train"):
+        qeuries_cpu = qeuries.detach().cpu().numpy()
+        normalize_L2(qeuries_cpu)
+        _, I1 = self.seq_emb_index.search(qeuries_cpu, 4*topk)
         I1_filtered = []
         for i, I_entry in enumerate(I1):
             current_user = batch_user_id[i]
@@ -492,100 +635,7 @@ class RaSeRec(SequentialRecommender):
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
         # aug
         seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, mode="test")
-        seq_output_aug = torch.where((item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, self.hidden_size), seq_output, seq_output_aug)
+        seq_output_aug = torch.where((item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, 64), seq_output, seq_output_aug)
         test_items_emb = self.item_embedding.weight
         scores = torch.matmul(seq_output_aug, test_items_emb.transpose(0, 1))  # [B n_items]
         return scores
-
-    def retriever_forward(self, seq_output):
-        """检索器编码器前向传播 - 使用MLP对序列表示进行非线性变换"""
-        hidden = seq_output  # [B, H]
-        
-        # 应用MLP层
-        for idx, (layer, layer_norm) in enumerate(zip(self.retriever_mlp, self.retriever_layer_norms)):
-            residual = hidden  # 每层的残差连接
-            
-            # MLP变换
-            hidden = layer(hidden)
-            hidden = self.retriever_act_fn(hidden)
-            hidden = self.retriever_dropout_layer(hidden)
-            
-            # Layer Norm + 残差连接
-            hidden = layer_norm(hidden + residual)
-        
-        return hidden
-
-    def compute_retrieval_scores(self, seq_output, retrieved_seqs, retrieved_tars, pos_items):
-        """计算检索评分 - 基于检索器编码后序列与目标嵌入的融合相似度"""
-        batch_size, n_retrieved, hidden_size = retrieved_seqs.size()
-        pos_items_emb = self.item_embedding(pos_items)  # [batch_size, hidden_size]
-        
-        # 使用检索器编码器处理原始序列
-        retriever_encoded_seq = self.retriever_forward(seq_output)
-        
-        # 计算融合目标嵌入后的表示与目标项的相似度
-        fusion_scores = []
-        
-        # 对每个检索到的目标嵌入进行简单融合并计算相似度
-        for i in range(n_retrieved):
-            # 获取当前检索结果的目标嵌入
-            current_tar_emb = retrieved_tars[:, i, :]  # [batch_size, hidden_size]
-            
-            # 简单的加权融合：检索器编码后序列 + 检索目标嵌入
-            fused_rep = self.alpha * retriever_encoded_seq + (1 - self.alpha) * current_tar_emb
-            
-            # 计算融合后表示与目标项的点积相似度
-            similarity_score = torch.sum(fused_rep * pos_items_emb, dim=-1)  # [batch_size]
-            fusion_scores.append(similarity_score)
-        
-        # 将所有检索结果的相似度堆叠
-        stacked_scores = torch.stack(fusion_scores, dim=1)  # [batch_size, n_retrieved]
-        
-        # 应用温度缩放并转换为概率分布
-        retrieval_logits = stacked_scores / self.retriever_temperature
-        retrieval_probs = torch.softmax(retrieval_logits, dim=1)
-        
-        return retrieval_probs  # [batch_size, n_retrieved]
-
-    def compute_recommendation_scores(self, seq_output, retrieved_seqs, retrieved_tars):
-        """直接模拟DuoRec的full_sort_predict逻辑，但只针对k个检索项
-        
-        逻辑：
-        1. 使用seq_output（已经是DuoRec.forward的输出）
-        2. 不是与所有物品计算相似度，而是只与k个检索到的目标项计算
-        3. 本质上是full_sort_predict的"局部版本"
-        """
-        batch_size, n_retrieved, hidden_size = retrieved_tars.size()
-        
-        with torch.no_grad():
-            # 直接使用full_sort_predict的核心逻辑     
-            # 重塑retrieved_tars进行批量矩阵乘法从[batch_size, n_retrieved, hidden_size]变为[batch_size, hidden_size, n_retrieved]
-            retrieved_tars_t = retrieved_tars.transpose(1, 2)
-
-            # 与full_sort_predict中的torch.matmul(seq_output, test_items_emb.transpose(0, 1))相同
-            scores = torch.bmm(seq_output.unsqueeze(1), retrieved_tars_t).squeeze(1)  # [B, n_retrieved]
-            
-            # 使用softmax将分数转换为概率分布
-            recommendation_scores = torch.softmax(scores, dim=-1)
-            
-        return recommendation_scores
-
-    def compute_kl_loss(self, retrieval_probs, recommendation_probs):
-        """计算检索分布与推荐分布之间的KL散度损失
-           L = (1/|B|) * sum_x KL(P_R(d|x) || Q_M(d|x,y))
-        """     
-        # 确保两个分布的维度完全匹配
-        assert retrieval_probs.shape == recommendation_probs.shape, \
-            f"Shape mismatch: retrieval_probs {retrieval_probs.shape} vs recommendation_probs {recommendation_probs.shape}"
-        
-        # 避免数值问题
-        epsilon = 1e-8
-        retrieval_probs = retrieval_probs + epsilon
-        recommendation_probs = recommendation_probs + epsilon
-        
-        # KL散度计算: KL(retrieval_probs || recommendation_probs)
-        # 优化检索分布使其接近推荐分布
-        kl_div = torch.sum(retrieval_probs * torch.log(retrieval_probs / recommendation_probs), dim=-1)
-        
-        # 返回批次平均损失
-        return kl_div.mean()
