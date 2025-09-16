@@ -25,7 +25,7 @@ from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import activation_layer, CrossMultiHeadAttention, FeedForward
 from recbole.model.sequential_recommender.pretrained_model_loader import PretrainedModelLoader
 import torch.nn.functional as F
-from recbole.utils.ttararec_diagnostics import compute_retrieval_effectiveness_vectorized, print_diagnostic_info_optimized, get_attention_grad_norms
+from recbole.utils.ttararec_diagnostics import compute_retrieval_effectiveness_vectorized, print_diagnostic_info_optimized
 
 
 class TTARArec(SequentialRecommender):
@@ -82,9 +82,6 @@ class TTARArec(SequentialRecommender):
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
         self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
 
-        # 测试阶段输出Top-K推荐结果控制（仅最终测试使用）
-        self.final_test_mode = False
-        self.final_test_topk = 30
         # ========== 5. 构建检索器和融合组件 ==========
         self._build_retrieval_components(config)
 
@@ -350,8 +347,7 @@ class TTARArec(SequentialRecommender):
         # 使用PyTorch的kl_div函数，更数值稳定
         # kl_div接受log概率作为第一个参数，目标分布作为第二个参数
         # KL(attention_probs || retrieval_probs)
-        log_retrieval_probs = torch.log(retrieval_probs + 1e-8)
-        kl_div = F.kl_div(log_retrieval_probs, attention_probs, reduction='batchmean')
+        kl_div = F.kl_div(torch.log(attention_probs + 1e-8), retrieval_probs, reduction='batchmean')
         
         return kl_div
 
@@ -764,13 +760,5 @@ class TTARArec(SequentialRecommender):
         # 计算与所有物品的得分
         test_items_emb = self.pretrained_model.item_embedding.weight
         scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
-        if self.final_test_mode:
-            with torch.no_grad():
-                topk = min(self.final_test_topk, scores.size(1))
-                _, top_indices = torch.topk(scores, k=topk, dim=1)
-                top_indices_cpu = top_indices.detach().cpu().numpy()
-                for i in range(top_indices_cpu.shape[0]):
-                    print(f"[Final-Test-Top{topk}] Sample {i} -> items: {top_indices_cpu[i].tolist()}")
         
         return scores
-
