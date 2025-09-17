@@ -239,62 +239,7 @@ class TTARArec(SequentialRecommender):
             torch.tensor(retrieval_tar_items).to("cuda"),  # 目标物品ID
         )   
     # ============ 损失计算相关方法 ============
-
-
-
-    def compute_enhanced_sequences(self, retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output):
-        """计算增强序列表征 - 将检索到的目标物品ID拼接到原始序列末尾（完全GPU向量化）"""
-        batch_size, n_retrieved = retrieved_tar_items.size()
-        max_seq_len = item_seq.size(1)
-        
-        # 将batch_seq_len转换为GPU张量
-        current_seq_lens = torch.from_numpy(batch_seq_len).to(item_seq.device)
-        
-        # 批量处理所有检索结果，避免循环
-        # 扩展原始序列以匹配检索数量 [B, K, max_seq_len]
-        item_seq_expanded = item_seq.unsqueeze(1).expand(-1, n_retrieved, -1)
-        enhanced_seqs = item_seq_expanded.clone()  # [B, K, max_seq_len]
-        
-        # 计算新序列长度（原序列长度 + 1个目标物品）
-        new_seq_lens = torch.clamp(current_seq_lens + 1, max=max_seq_len)  # [B]
-        new_seq_lens_expanded = new_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-        
-        # 向量化添加目标物品到序列末尾
-        batch_indices = torch.arange(batch_size, device=item_seq.device).unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-        retrieve_indices = torch.arange(n_retrieved, device=item_seq.device).unsqueeze(0).expand(batch_size, -1)  # [B, K]
-        
-        # 创建掩码：只在序列长度小于max_seq_len时添加目标物品
-        valid_append_mask = current_seq_lens.unsqueeze(1) < max_seq_len  # [B, 1]
-        
-        # 使用高级索引批量设置目标物品
-        if valid_append_mask.any():
-            # 获取可以添加目标物品的位置
-            append_positions = current_seq_lens.unsqueeze(1).expand(-1, n_retrieved)  # [B, K]
-            
-            # 创建索引张量来批量设置值
-            valid_positions = append_positions < max_seq_len
-            if valid_positions.any():
-                # 使用scatter_方法批量设置目标物品
-                batch_idx_flat = batch_indices[valid_positions]
-                retrieve_idx_flat = retrieve_indices[valid_positions]
-                position_flat = append_positions[valid_positions]
-                target_items_flat = retrieved_tar_items[batch_idx_flat, retrieve_idx_flat]
-                
-                enhanced_seqs[batch_idx_flat, retrieve_idx_flat, position_flat] = target_items_flat
-        
-        # 批量重新编码所有增强序列
-        # 将[B, K, max_seq_len]重塑为[B*K, max_seq_len]进行批量编码
-        enhanced_seqs_flat = enhanced_seqs.reshape(batch_size * n_retrieved, max_seq_len)
-        new_seq_lens_flat = new_seq_lens_expanded.reshape(batch_size * n_retrieved)
-        
-        # 批量编码
-        enhanced_outputs_flat = self.forward(enhanced_seqs_flat, new_seq_lens_flat)  # [B*K, hidden_size]
-        
-        # 重塑回[B, K, hidden_size]
-        enhanced_sequences = enhanced_outputs_flat.reshape(batch_size, n_retrieved, -1)
-        
-        return enhanced_sequences
-
+    
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
         batch_size = pos_items.size(0)
         n_retrieved = enhanced_sequences.size(1) 
@@ -361,12 +306,10 @@ class TTARArec(SequentialRecommender):
             topk=self.topk
         )
 
-        # 一次性计算增强序列表征，供后续复用
-        enhanced_sequences = self.compute_enhanced_sequences(
-            retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
-        )
-
-        # 使用预计算的增强序列表征进行序列增强
+        # 直接使用检索到的目标 item 向量进行融合（最小改动，保留原增强序列用于检索对齐与诊断）
+        target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
+        enhanced_sequences=target_embs
+        # 使用检索到的目标 item 向量进行序列增强
         seq_output_aug = self.seq_augmented(
             seq_output, batch_user_id, batch_seq_len, 
             enhanced_sequences=enhanced_sequences
@@ -380,20 +323,22 @@ class TTARArec(SequentialRecommender):
             rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
 
         # 计算检索评分：使用预计算的增强序列表征
+
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
             enhanced_sequences=enhanced_sequences
         )  # [B, K]
         
-        # 计算注意力评分：使用增强序列表征
+        # 计算注意力评分：使用目标 item 嵌入
         attention_probs = self.compute_attention_scores(
             seq_output, None, None, enhanced_sequences=enhanced_sequences
-        )  # [B, K]
+        ) 
         
         # 计算KL散度损失（注意力评分向检索评分对齐）
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
 
         # ============ 诊断信息输出 ============
+    
         # 每33个batch输出一次诊断信息
         if hasattr(self, 'batch_count'):
             self.batch_count += 1
@@ -416,10 +361,6 @@ class TTARArec(SequentialRecommender):
         total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         
         return total_loss
-
-
-
-
 
     # ============ 知识库构建相关方法 ============
     
@@ -668,23 +609,17 @@ class TTARArec(SequentialRecommender):
         """启用检索增强功能"""
         self.use_retrieval = True
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", pos_items=None, enhanced_sequences=None, item_seq=None, item_seq_len=None):
+    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", enhanced_sequences=None):
         """序列增强 - 使用训练后的交叉注意力层进行索引融合"""
-        # 如果已有增强序列表征，直接使用；否则计算
         if enhanced_sequences is not None:
-            # 直接使用预计算的增强序列表征
             retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
         else:
-            # 检索相似序列和目标物品ID
             retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
                 seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
             )
-            # 若能提供原始序列与长度，则计算增强序列表征；否则回退到原有K/V（retrieved_seqs/retrieved_tar_items）
-            if (item_seq is not None) and (item_seq_len is not None):
-                enhanced_sequences = self.compute_enhanced_sequences(
-                    retrieved_item_seqs, retrieved_tar_items, item_seq, item_seq_len, batch_seq_len, query_output=seq_output
-                )
-                retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
+            # 直接使用检索到的目标 item 嵌入进行融合（最小改动）
+            target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
+            retrieval_enhanced_output = self.fusion_forward(seq_output, target_embs)
         
         # 与原始序列表征进行加权融合
         augmented_output = seq_output * self.fusion_weight + retrieval_enhanced_output * (1 - self.fusion_weight)
@@ -712,8 +647,7 @@ class TTARArec(SequentialRecommender):
             batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
             batch_seq_len = item_seq_len.detach().cpu().numpy()
             seq_output = self.seq_augmented(
-                seq_output, batch_user_id, batch_seq_len, mode="test",
-                item_seq=item_seq, item_seq_len=item_seq_len
+                seq_output, batch_user_id, batch_seq_len, mode="test"
             )
         
         # 计算与所有物品的得分
