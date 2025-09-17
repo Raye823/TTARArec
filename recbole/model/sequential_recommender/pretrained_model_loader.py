@@ -4,32 +4,89 @@
 # @Email   : zhaoxinping@stu.hit.edu.cn
 
 """
-预训练模型加载器 - 简化版
+预训练模型加载器 - 通用版
 ################################################
 
-用于加载DuoRec预训练模型供TTARArec使用
+用于加载多种预训练模型供TTARArec使用，支持DuoRec、SASRec、GRU4Rec、CL4SRec
+
+使用方法：
+1. 在配置文件中设置 pretrained_model_type: 'sasrec'  # 可选: duorec, sasrec, gru4rec, cl4srec
+2. 设置 pretrained_model_path: '/path/to/checkpoint.pth'
+3. TTARArec会自动根据模型类型加载对应的预训练模型
+
+支持的模型类型及其主要参数：
+- duorec: Transformer + 对比学习，参数包括 n_layers, n_heads, hidden_size, lmd, tau 等
+- sasrec: 标准 Self-Attention，参数包括 n_layers, n_heads, hidden_size, inner_size 等  
+- gru4rec: GRU-based，参数包括 embedding_size, hidden_size, num_layers 等
+- cl4srec: Transformer + 对比学习，参数包括 n_layers, n_heads, hidden_size, lmd, tau, sim 等
 """
 
 import torch
 from recbole.model.sequential_recommender.duorec import DuoRec
+from recbole.model.sequential_recommender.sasrec import SASRec
+from recbole.model.sequential_recommender.gru4rec import GRU4Rec
+from recbole.model.sequential_recommender.cl4srec import CL4SRec
 
 
 class PretrainedModelLoader:
-    """简化的预训练模型加载器"""
+    """通用的预训练模型加载器"""
+    
+    # 模型类映射
+    MODEL_CLASSES = {
+        'duorec': DuoRec,
+        'sasrec': SASRec,
+        'gru4rec': GRU4Rec,
+        'cl4srec': CL4SRec
+    }
+    
+    # 每个模型的架构参数
+    MODEL_ARCHITECTURE_PARAMS = {
+        'duorec': [
+            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
+            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
+            'layer_norm_eps', 'initializer_range', 'loss_type',
+            'lmd', 'lmd_sem', 'contrast', 'tau', 'sim'
+        ],
+        'sasrec': [
+            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
+            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
+            'layer_norm_eps', 'initializer_range', 'loss_type'
+        ],
+        'gru4rec': [
+            'embedding_size', 'hidden_size', 'loss_type',
+            'num_layers', 'dropout_prob'
+        ],
+        'cl4srec': [
+            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
+            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
+            'layer_norm_eps', 'initializer_range', 'loss_type',
+            'batch_size', 'train_batch_size', 'lmd', 'tau', 'sim'
+        ]
+    }
     
     @staticmethod
-    def load_duorec_model(config, dataset):
+    def load_model(config, dataset, model_type=None):
         """
-        加载DuoRec预训练模型
+        通用模型加载方法
         
         Args:
             config: 配置字典
             dataset: 数据集对象
+            model_type: 模型类型，如果未指定则从config中获取
             
         Returns:
-            加载好的DuoRec模型实例
+            加载好的模型实例
         """
-        print("正在加载DuoRec预训练模型...")
+        if model_type is None:
+            model_type = config['pretrained_model_type'].lower()
+        
+        if model_type not in PretrainedModelLoader.MODEL_CLASSES:
+            raise ValueError(f"不支持的模型类型: {model_type}. 支持的类型: {list(PretrainedModelLoader.MODEL_CLASSES.keys())}")
+        
+        print(f"正在加载{model_type.upper()}预训练模型...")
+        
+        model_class = PretrainedModelLoader.MODEL_CLASSES[model_type]
+        architecture_params = PretrainedModelLoader.MODEL_ARCHITECTURE_PARAMS[model_type]
         
         # 加载预训练权重和配置
         model_path = config['pretrained_model_path']
@@ -55,31 +112,80 @@ class PretrainedModelLoader:
             
             # 合并配置：使用预训练模型的架构配置
             if pretrained_config:
-                architecture_params = [
-                    'n_layers', 'n_heads', 'hidden_size', 'inner_size',
-                    'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
-                    'layer_norm_eps', 'initializer_range', 'loss_type',
-                    'lmd', 'lmd_sem', 'contrast', 'tau', 'sim'
-                ]
-                
                 for param in architecture_params:
                     if param in pretrained_config:
                         config[param] = pretrained_config[param]
             
-            # 创建DuoRec模型实例
-            model = DuoRec(config, dataset)
+            # 创建模型实例
+            model = model_class(config, dataset)
             
             # 加载预训练权重
             if state_dict:
                 model.load_state_dict(state_dict, strict=False)
         else:
-            model = DuoRec(config, dataset)
+            model = model_class(config, dataset)
         
         # 设置为推理模式并冻结参数
         model.eval()
         for param in model.parameters():
             param.requires_grad = False
         
-        print(f"DuoRec模型加载成功!")
+        print(f"{model_type.upper()}模型加载成功!")
         
-        return model 
+        return model
+    
+    @staticmethod
+    def load_duorec_model(config, dataset):
+        """
+        加载DuoRec预训练模型（为了保持向后兼容性）
+        
+        Args:
+            config: 配置字典
+            dataset: 数据集对象
+            
+        Returns:
+            加载好的DuoRec模型实例
+        """
+        return PretrainedModelLoader.load_model(config, dataset, 'duorec')
+    
+    @staticmethod
+    def load_sasrec_model(config, dataset):
+        """
+        加载SASRec预训练模型
+        
+        Args:
+            config: 配置字典
+            dataset: 数据集对象
+            
+        Returns:
+            加载好的SASRec模型实例
+        """
+        return PretrainedModelLoader.load_model(config, dataset, 'sasrec')
+    
+    @staticmethod
+    def load_gru4rec_model(config, dataset):
+        """
+        加载GRU4Rec预训练模型
+        
+        Args:
+            config: 配置字典
+            dataset: 数据集对象
+            
+        Returns:
+            加载好的GRU4Rec模型实例
+        """
+        return PretrainedModelLoader.load_model(config, dataset, 'gru4rec')
+    
+    @staticmethod
+    def load_cl4srec_model(config, dataset):
+        """
+        加载CL4SRec预训练模型
+        
+        Args:
+            config: 配置字典
+            dataset: 数据集对象
+            
+        Returns:
+            加载好的CL4SRec模型实例
+        """
+        return PretrainedModelLoader.load_model(config, dataset, 'cl4srec') 
