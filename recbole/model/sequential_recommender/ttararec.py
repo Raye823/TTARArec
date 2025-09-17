@@ -295,31 +295,26 @@ class TTARArec(SequentialRecommender):
         
         return enhanced_sequences
 
-    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None, query_output=None, neg_items=None):
+    def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
         batch_size = pos_items.size(0)
         n_retrieved = enhanced_sequences.size(1) 
         pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
         all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
 
         if enhanced_sequences is not None:
-            # 按逐序列BPR损失对齐
-            if neg_items is not None:
-                # 正项分数 [B, K]
-                pos_scores_k = torch.sum(enhanced_sequences * pos_items_emb.unsqueeze(1), dim=-1)
-                # 负项分数
-                neg_items_emb = self.get_item_embedding(neg_items)  # [B,H] 或 [B,n_neg,H]
-                if neg_items_emb.dim() == 2:
-                    # 单负样本：为每个增强序列重复该负样本
-                    neg_scores_k = torch.sum(enhanced_sequences * neg_items_emb.unsqueeze(1), dim=-1)  # [B,K]
-                    bpr_k = F.softplus(-(pos_scores_k - neg_scores_k))  # [B,K]
-                else:
-                    # 多负样本：对每个增强序列与所有负样本逐对计算，再对负样本求均值
-                    # neg_items_emb: [B,n_neg,H] -> [B,1,n_neg,H]
-                    neg_scores_all = torch.sum(
-                        enhanced_sequences.unsqueeze(2) * neg_items_emb.unsqueeze(1), dim=-1
-                    )  # [B,K,n_neg]
-                    bpr_k = F.softplus(-(pos_scores_k.unsqueeze(2) - neg_scores_all)).mean(dim=2)  # [B,K]
-                logits = -bpr_k  # 损失越小越好
+            if self.loss_type == 'CE':
+                # CE损失对齐：计算每个增强序列与所有物品的logits，然后提取正样本位置的概率
+                # enhanced_sequences: [B, K, H], all_items_emb: [N, H]
+                logits_k = torch.matmul(enhanced_sequences, all_items_emb.transpose(0, 1))  # [B, K, N]
+                
+                # 计算每个增强序列的CE损失（负log似然）
+                ce_losses_k = F.cross_entropy(
+                    logits_k.reshape(-1, logits_k.size(-1)),  # [B*K, N]
+                    pos_items.unsqueeze(1).expand(-1, n_retrieved).reshape(-1),  # [B*K]
+                    reduction='none'
+                ).reshape(batch_size, n_retrieved)  # [B, K]
+                
+                logits = -ce_losses_k  # 损失越小越好，转为正分数
                 tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1
         return torch.softmax(logits / max(tau, 1e-6), dim=1).detach()
 
@@ -378,21 +373,7 @@ class TTARArec(SequentialRecommender):
         )
             
         # 计算推荐损失（支持CE/BPR）
-        if self.loss_type == 'BPR':
-            # 标准BPR：统一使用 RecBole 的 BPRLoss；
-            # 负样本来源：
-            # - 优先从数据管线 interaction 读取 NEG_ITEM_ID（推荐）
-            # 管线负采样（标准做法）
-            neg_items = interaction[self.NEG_ITEM_ID]
-            neg_items_emb = self.get_item_embedding(neg_items)  # [B, H] 或 [B, n_neg, H]
-            pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-            if neg_items_emb.dim() == 2:
-                neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
-                rec_loss = self.loss_fct(pos_score, neg_score)
-            else:
-                neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, n_neg]
-                rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
-        else:
+        if self.loss_type == 'CE':
             # 默认回退CE
             test_item_emb = self.pretrained_model.item_embedding.weight
             logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
@@ -402,7 +383,7 @@ class TTARArec(SequentialRecommender):
         neg_items_for_ret = interaction[self.NEG_ITEM_ID]
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
-            enhanced_sequences=enhanced_sequences, query_output=seq_output_aug, neg_items=neg_items_for_ret
+            enhanced_sequences=enhanced_sequences
         )  # [B, K]
         
         # 计算注意力评分：使用增强序列表征
