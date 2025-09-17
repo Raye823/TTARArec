@@ -43,7 +43,7 @@ class TTARArec(SequentialRecommender):
         super(TTARArec, self).__init__(config, dataset)
 
         # ========== 1. 加载预训练模型 ==========
-        self.pretrained_model = PretrainedModelLoader.load_duorec_model(config, dataset)
+        self.pretrained_model = PretrainedModelLoader.load_model(config, dataset)
         self.pretrained_model.requires_grad_(False)
         
         # ========== 2. 从预训练模型获取基础架构参数 ==========
