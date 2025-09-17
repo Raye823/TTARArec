@@ -53,9 +53,6 @@ class TTARArec(SequentialRecommender):
         # 损失类型（CE 或 BPR）
         self.loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
         self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
-        # BPR硬负采样配置
-        self.bpr_num_negatives = config['bpr_num_negatives'] if 'bpr_num_negatives' in config else 1
-        self.bpr_hard_negatives = config['bpr_hard_negatives'] if 'bpr_hard_negatives' in config else False
         # 定义损失函数
         if self.loss_type == 'BPR':
             self.loss_fct = BPRLoss()
@@ -385,34 +382,16 @@ class TTARArec(SequentialRecommender):
             # 标准BPR：统一使用 RecBole 的 BPRLoss；
             # 负样本来源：
             # - 优先从数据管线 interaction 读取 NEG_ITEM_ID（推荐）
-            # - 可选启用硬负采样，仅用于“选负样本”，损失依旧走 BPRLoss
-            pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
-            if getattr(self, 'bpr_hard_negatives', False):
-                # 硬负样本选择
-                all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
-                scores_full = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]
-                batch_idx = torch.arange(scores_full.size(0), device=scores_full.device)
-                scores_full[batch_idx, pos_items] = -1e9  # 屏蔽正样本
-                k = int(getattr(self, 'bpr_num_negatives', 1))
-                k = max(1, min(k, scores_full.size(1) - 1))
-                _, neg_idx = torch.topk(scores_full, k=k, dim=1, largest=True)  # [B, K]
-                neg_items_emb = all_items_emb[neg_idx]  # [B, K, H]
-                # 分数
-                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-                neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, K]
-                # 展平为标准 BPRLoss 输入
-                rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
+            # 管线负采样（标准做法）
+            neg_items = interaction[self.NEG_ITEM_ID]
+            neg_items_emb = self.get_item_embedding(neg_items)  # [B, H] 或 [B, n_neg, H]
+            pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
+            if neg_items_emb.dim() == 2:
+                neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
+                rec_loss = self.loss_fct(pos_score, neg_score)
             else:
-                # 管线负采样（标准做法）
-                neg_items = interaction[self.NEG_ITEM_ID]
-                neg_items_emb = self.get_item_embedding(neg_items)  # [B, H] 或 [B, n_neg, H]
-                pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-                if neg_items_emb.dim() == 2:
-                    neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
-                    rec_loss = self.loss_fct(pos_score, neg_score)
-                else:
-                    neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, n_neg]
-                    rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
+                neg_score = torch.sum(seq_output_aug.unsqueeze(1) * neg_items_emb, dim=-1)  # [B, n_neg]
+                rec_loss = self.loss_fct(pos_score.unsqueeze(1).expand_as(neg_score).reshape(-1), neg_score.reshape(-1))
         else:
             # 默认回退CE
             test_item_emb = self.pretrained_model.item_embedding.weight

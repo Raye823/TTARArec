@@ -96,94 +96,6 @@ class RaSeRec(SequentialRecommender):
         self.apply(self._init_weights)
         # precached knowledge
         self.dataset = dataset
-        
-        # 调试相关属性
-        self.batch_count = 129
-        self.debug_enabled = config['debug_enabled'] if 'debug_enabled' in config else True
-    
-    def print_diagnostic_info_raserec(self, seq_output, seq_output_aug, pos_items, attention_probs):
-        """RaSeRec 专用的调试信息输出"""
-        if not self.debug_enabled:
-            return
-            
-        with torch.no_grad():
-            # 批量计算所有GPU指标，最后一次性传输到CPU
-            gpu_metrics = {}
-            
-            # 注意力评分分析
-            gpu_metrics['attention_std'] = attention_probs.std()
-            gpu_metrics['attention_entropy'] = -torch.sum(attention_probs * torch.log(attention_probs + 1e-8), dim=-1).mean()
-            
-            # 增强效果分析
-            gpu_metrics['seq_similarity'] = torch.cosine_similarity(seq_output, seq_output_aug, dim=-1).mean()
-            pos_items_emb = self.item_embedding(pos_items)
-            gpu_metrics['original_sim'] = torch.sum(seq_output * pos_items_emb, dim=-1).mean()
-            gpu_metrics['augmented_sim'] = torch.sum(seq_output_aug * pos_items_emb, dim=-1).mean()
-            gpu_metrics['sim_improvement'] = gpu_metrics['augmented_sim'] - gpu_metrics['original_sim']
-            
-            # 排序间隔指标（完全在GPU上计算）
-            test_item_emb = self.item_embedding.weight  # [n_items, H]
-            batch_size_local = seq_output.size(0)
-            batch_indices = torch.arange(batch_size_local, device=seq_output.device)
-            
-            # 原始与增强的全物品打分
-            original_logits_full = torch.matmul(seq_output, test_item_emb.transpose(0, 1))  # [B, N]
-            augmented_logits_full = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))  # [B, N]
-            
-            # 正样本分数
-            pos_scores_original = original_logits_full[batch_indices, pos_items]
-            pos_scores_augmented = augmented_logits_full[batch_indices, pos_items]
-            
-            # 负样本屏蔽（将正样本位置置为极小值）
-            original_logits_masked = original_logits_full.clone()
-            original_logits_masked[batch_indices, pos_items] = -1e9
-            augmented_logits_masked = augmented_logits_full.clone()
-            augmented_logits_masked[batch_indices, pos_items] = -1e9
-            
-            # Top-1负样本
-            top1_neg_original = torch.max(original_logits_masked, dim=1).values
-            top1_neg_augmented = torch.max(augmented_logits_masked, dim=1).values
-            
-            # 间隔（Top-1负样本）
-            gpu_metrics['original_margin_top1'] = (pos_scores_original - top1_neg_original).mean()
-            gpu_metrics['augmented_margin_top1'] = (pos_scores_augmented - top1_neg_augmented).mean()
-            gpu_metrics['margin_top1_improvement'] = gpu_metrics['augmented_margin_top1'] - gpu_metrics['original_margin_top1']
-            
-            # Top-10负样本均值间隔（可选）
-            topk = 10 if augmented_logits_masked.size(1) >= 10 else max(1, int(augmented_logits_masked.size(1) // 100))
-            if topk > 1:
-                topk_neg_original = torch.topk(original_logits_masked, k=topk, dim=1).values.mean(dim=1)
-                topk_neg_augmented = torch.topk(augmented_logits_masked, k=topk, dim=1).values.mean(dim=1)
-                gpu_metrics['original_margin_topk'] = (pos_scores_original - topk_neg_original).mean()
-                gpu_metrics['augmented_margin_topk'] = (pos_scores_augmented - topk_neg_augmented).mean()
-                gpu_metrics['margin_topk_improvement'] = gpu_metrics['augmented_margin_topk'] - gpu_metrics['original_margin_topk']
-            else:
-                gpu_metrics['original_margin_topk'] = gpu_metrics['original_margin_top1']
-                gpu_metrics['augmented_margin_topk'] = gpu_metrics['augmented_margin_top1']
-                gpu_metrics['margin_topk_improvement'] = gpu_metrics['margin_top1_improvement']
-            
-            # 一次性将所有GPU指标传输到CPU
-            cpu_metrics = {k: v.item() if torch.is_tensor(v) else v for k, v in gpu_metrics.items()}
-            
-            # 输出结果
-            print(f"\n========== RaSeRec 诊断信息 (Batch {self.batch_count}) ==========")
-            
-            print(f"\n--- 注意力评分分布 ---")
-            print(f"注意力评分标准差: {cpu_metrics['attention_std']:.6f}")
-            print(f"注意力评分熵: {cpu_metrics['attention_entropy']:.6f}")
-            
-            print(f"\n--- 增强效果 ---")
-            print(f"原始序列与增强序列相似度: {cpu_metrics['seq_similarity']:.6f}")
-            print(f"原始序列与目标项相似度: {cpu_metrics['original_sim']:.6f}")
-            print(f"增强序列与目标项相似度: {cpu_metrics['augmented_sim']:.6f}")
-            print(f"增强带来的相似度提升: {cpu_metrics['sim_improvement']:.6f}")
-            print(f"原始序列Top-1负样本间隔: {cpu_metrics['original_margin_top1']:.6f}")
-            print(f"增强序列Top-1负样本间隔: {cpu_metrics['augmented_margin_top1']:.6f}")
-            print(f"Top-1间隔提升: {cpu_metrics['margin_top1_improvement']:.6f}")
-            print(f"原始序列Top-10均值负样本间隔: {cpu_metrics['original_margin_topk']:.6f}")
-            print(f"增强序列Top-10均值负样本间隔: {cpu_metrics['augmented_margin_topk']:.6f}")
-            print(f"Top-10间隔提升: {cpu_metrics['margin_topk_improvement']:.6f}")
-            print(f"========================================\n")
 
     def precached_knowledge(self):
         length_threshold = 1
@@ -461,37 +373,22 @@ class RaSeRec(SequentialRecommender):
         #return output  # [B H]
         return output.requires_grad_(True)  # 确保输出需要梯度
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", return_attention=False):
+    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train"):
         torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, torch_retrieval_seq_embs2, torch_retrieval_tar_embs2 = self.retrieve_seq_tar(seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode)
 
         # augmentation
-        if return_attention:
-            seq_output_saug, attn_weights_1 = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, return_attention=True)
-            seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
-            seq_output_saug, attn_weights_2 = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1, return_attention=True) 
-            seq_output_taug, attn_weights_3 = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2, return_attention=True)
-            seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
-            seq_output_taug, attn_weights_4 = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2, return_attention=True)
-            # 合并注意力权重
-            combined_attention_weights = (attn_weights_1 + attn_weights_2 + attn_weights_3 + attn_weights_4) / 4.0
-        else:
-            seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
-            seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
-            seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1) 
-            seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
-            seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
-            seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
-        
+        seq_output_saug = self.seq_tar_ram(seq_output.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1)
+        seq_output_saug = self.seq_tar_ram_fnn(seq_output_saug)
+        seq_output_saug = self.seq_tar_ram_1(seq_output_saug.unsqueeze(1), torch_retrieval_seq_embs1, torch_retrieval_tar_embs1) 
+        seq_output_taug = self.tar_seq_ram(seq_output.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
+        seq_output_taug = self.tar_seq_ram_fnn(seq_output_taug)
+        seq_output_taug = self.tar_seq_ram_1(seq_output_taug.unsqueeze(1), torch_retrieval_tar_embs2, torch_retrieval_seq_embs2)
         alpha = self.alpha
         beta = self.beta
 
         # output
-        seq_output_final = alpha*seq_output+(1-alpha)*(beta*seq_output_saug+(1-beta)*seq_output_taug)
-        
-        if return_attention:
-            return seq_output_final, combined_attention_weights
-        else:
-            return seq_output_final
+        seq_output = alpha*seq_output+(1-alpha)*(beta*seq_output_saug+(1-beta)*seq_output_taug)
+        return seq_output
 
     def calculate_loss(self, interaction):
         item_seq = interaction[self.ITEM_SEQ]
@@ -500,16 +397,9 @@ class RaSeRec(SequentialRecommender):
         pos_items = interaction[self.POS_ITEM_ID]
         batch_user_id = list(interaction[self.USER_ID].detach().cpu().numpy())
         batch_seq_len = list(item_seq_len.detach().cpu().numpy())
-        
-        # aug - 获取注意力权重用于调试
-        if self.debug_enabled:
-            seq_output_aug, attention_probs = self.seq_augmented(seq_output, batch_user_id, batch_seq_len, return_attention=True)
-        else:
-            seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
-            attention_probs = None
-            
+        # aug
+        seq_output_aug = self.seq_augmented(seq_output, batch_user_id, batch_seq_len)
         seq_output_aug = torch.where((item_seq_len > self.low_popular).unsqueeze(-1).repeat(1, 64), seq_output, seq_output_aug)
-        
         if self.loss_type == 'BPR':
             neg_items = interaction[self.NEG_ITEM_ID]
             pos_items_emb = self.item_embedding(pos_items)
@@ -519,15 +409,9 @@ class RaSeRec(SequentialRecommender):
             loss = self.loss_fct(pos_score, neg_score)
         else:  # self.loss_type = 'CE'
             #test_item_emb = self.item_embedding.weight
-            test_item_emb = self.item_embedding.weight  # 确保嵌入需要梯度
+            test_item_emb = self.item_embedding.weight.requires_grad_(True)  # 确保嵌入需要梯度
             logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
             loss = self.loss_fct(logits, pos_items)
-
-        # 调试信息输出
-        if self.debug_enabled and attention_probs is not None:
-            self.batch_count += 1
-            if self.batch_count % 129 == 0:
-                self.print_diagnostic_info_raserec(seq_output, seq_output_aug, pos_items, attention_probs)
 
         return loss
 
