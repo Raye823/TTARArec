@@ -71,7 +71,7 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     # 初始化TTARArec的知识库
     logger.info("正在构建TTARArec检索知识库...")
     try:
-        model.precached_knowledge()
+        model.precached_knowledge(valid_data)
         logger.info("检索知识库构建完成!")
     except Exception as e:
         logger.error(f"构建检索知识库时出错: {e}")
@@ -107,7 +107,7 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     logger.info("="*30)
     logger.info("最佳模型评估")
     logger.info("="*30)
-    model.precached_knowledge_val(valid_data)
+    model.precached_knowledge_val(valid_data, test_data)
     test_result = trainer.evaluate(test_data, load_best_model=saved, show_progress=config['show_progress'])
     logger.info(set_color('最佳验证结果', 'green') + f': {best_valid_result}')
     logger.info(set_color('最终测试结果', 'green') + f': {test_result}')
