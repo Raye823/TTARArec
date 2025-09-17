@@ -380,7 +380,6 @@ class TTARArec(SequentialRecommender):
             rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
 
         # 计算检索评分：使用预计算的增强序列表征
-        neg_items_for_ret = interaction[self.NEG_ITEM_ID]
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
             enhanced_sequences=enhanced_sequences
