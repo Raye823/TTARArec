@@ -65,7 +65,7 @@ train_batch_size: 256
 learner: adam
 learning_rate: 0.001
 eval_step: 1
-stopping_step: 20
+stopping_step: 10
 weight_decay: 0
 
 # ======================================
@@ -90,7 +90,7 @@ len_bound_reverse: False          # 是否反转长度过滤条件
 # ======================================
 # 检索器编码器参数
 # ======================================
-retriever_layers: 0              # 检索器MLP层数
+retriever_layers: 1              # 检索器MLP层数
 retriever_dropout: 0           # 检索器Dropout率
 
 
@@ -106,7 +106,6 @@ fusion_layer_norm_eps: 1e-12    # 交叉注意力LayerNorm epsilon
 # 损失函数和融合权重参数
 # ======================================
 kl_loss_weight:  0.2            # KL散度损失权重
-fusion_weight: 0.5               # 序列增强时的融合权重：fusion_weight*原序列 + (1-fusion_weight)*检索增强
 
 # ======================================
 

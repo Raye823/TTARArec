@@ -77,7 +77,6 @@ class TTARArec(SequentialRecommender):
         
         # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
-        self.fusion_weight = config['fusion_weight'] if 'fusion_weight' in config else 0.5
 
         # ========== 5. 构建检索器和融合组件 ==========
         self._build_retrieval_components(config)
@@ -237,7 +236,24 @@ class TTARArec(SequentialRecommender):
             torch.tensor(retrieval_seqs).to("cuda"), 
             torch.tensor(retrieval_item_seqs).to("cuda"),  # 原始交互序列
             torch.tensor(retrieval_tar_items).to("cuda"),  # 目标物品ID
-        )   
+        )
+
+    def compute_entropy(self, logits):
+        """计算logits的熵"""
+        probs = F.softmax(logits, dim=-1)
+        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+        return entropy
+    
+    def compute_alpha_weights(self, logits1, logits2):
+        """基于两个logits的熵计算融合权重α"""
+        h1 = self.compute_entropy(logits1)  # [B] 或 [B,K]
+        h2 = self.compute_entropy(logits2)  # [B] 或 [B,K]
+        
+        exp_h1 = torch.exp(1.0 / (1.0 + h1))
+        exp_h2 = torch.exp(1.0 / (1.0 + h2))
+        alpha = exp_h1 / (exp_h1 + exp_h2)
+        
+        return alpha   
     # ============ 损失计算相关方法 ============
     
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
@@ -621,8 +637,13 @@ class TTARArec(SequentialRecommender):
             target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
             retrieval_enhanced_output = self.fusion_forward(seq_output, target_embs)
         
-        # 与原始序列表征进行加权融合
-        augmented_output = seq_output * self.fusion_weight + retrieval_enhanced_output * (1 - self.fusion_weight)
+        all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
+        logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]       
+        logits2 = torch.matmul(retrieval_enhanced_output, all_items_emb.transpose(0, 1))  # [B, N]
+        alpha = self.compute_alpha_weights(logits1, logits2)  # [B]
+        # 将alpha从[B]扩展到[B, H]以匹配seq_output和retrieval_enhanced_output的维度
+        alpha_expanded = alpha.unsqueeze(-1)  # [B, 1] -> [B, H]
+        augmented_output = seq_output * alpha_expanded + retrieval_enhanced_output * (1 - alpha_expanded)
         
         return augmented_output
 
