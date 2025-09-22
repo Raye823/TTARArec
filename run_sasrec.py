@@ -2,7 +2,7 @@ import argparse
 from logging import getLogger
 from recbole.utils import init_logger, init_seed
 from recbole.trainer import Trainer
-from newmodel import NewModel
+from recbole.utils import get_model
 from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
 
@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', type=str, default='NewModel', help='model name')
     parser.add_argument('--dataset', type=str, default='Amazon_Beauty', help='dataset name')
-    parser.add_argument('--config_files', type=str, default='newmodel.yaml', help='config files')
+    parser.add_argument('--config_files', type=str, default='sasrec.yaml', help='config files')
     parser.add_argument('--saved', action='store_true', help='whether to save model')
     args = parser.parse_args()
     # 默认保存最佳模型（无需手动传 --saved）
@@ -51,8 +51,9 @@ def main():
     # dataset splitting
     train_data, valid_data, test_data = data_preparation(config, dataset)
 
-    # model loading and initialization
-    model = NewModel(config, train_data.dataset).to(config['device'])
+    # model loading and initialization via registry
+    model_cls = get_model('NewModel')
+    model = model_cls(config, train_data.dataset).to(config['device'])
     logger.info(model)
 
     # trainer loading and initialization
