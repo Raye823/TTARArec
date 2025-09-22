@@ -23,9 +23,8 @@
 
 import torch
 from recbole.model.sequential_recommender.duorec import DuoRec
-from recbole.model.sequential_recommender.sasrec import SASRec
-from recbole.model.sequential_recommender.gru4rec import GRU4Rec
-from recbole.model.sequential_recommender.cl4srec import CL4SRec
+from recbole.model.sequential_recommender.newmodel import NewModel
+
 
 
 class PretrainedModelLoader:
@@ -34,9 +33,8 @@ class PretrainedModelLoader:
     # 模型类映射
     MODEL_CLASSES = {
         'duorec': DuoRec,
-        'sasrec': SASRec,
-        'gru4rec': GRU4Rec,
-        'cl4srec': CL4SRec
+        'newmodel': NewModel,
+
     }
     
     # 每个模型的架构参数
@@ -47,20 +45,10 @@ class PretrainedModelLoader:
             'layer_norm_eps', 'initializer_range', 'loss_type',
             'lmd', 'lmd_sem', 'contrast', 'tau', 'sim'
         ],
-        'sasrec': [
-            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
-            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
-            'layer_norm_eps', 'initializer_range', 'loss_type'
-        ],
-        'gru4rec': [
-            'embedding_size', 'hidden_size', 'loss_type',
-            'num_layers', 'dropout_prob'
-        ],
-        'cl4srec': [
-            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
-            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
-            'layer_norm_eps', 'initializer_range', 'loss_type',
-            'batch_size', 'train_batch_size', 'lmd', 'tau', 'sim'
+        'newmodel': [
+            'n_layers', 'n_heads', 'hidden_size',
+            'hidden_dropout_prob', 'norm_first', 'hidden_act',
+            'initializer_range'
         ]
     }
     
@@ -162,30 +150,3 @@ class PretrainedModelLoader:
         """
         return PretrainedModelLoader.load_model(config, dataset, 'sasrec')
     
-    @staticmethod
-    def load_gru4rec_model(config, dataset):
-        """
-        加载GRU4Rec预训练模型
-        
-        Args:
-            config: 配置字典
-            dataset: 数据集对象
-            
-        Returns:
-            加载好的GRU4Rec模型实例
-        """
-        return PretrainedModelLoader.load_model(config, dataset, 'gru4rec')
-    
-    @staticmethod
-    def load_cl4srec_model(config, dataset):
-        """
-        加载CL4SRec预训练模型
-        
-        Args:
-            config: 配置字典
-            dataset: 数据集对象
-            
-        Returns:
-            加载好的CL4SRec模型实例
-        """
-        return PretrainedModelLoader.load_model(config, dataset, 'cl4srec') 

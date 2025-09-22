@@ -14,3 +14,5 @@ python run_ttararec.py --dataset Amazon_Beauty --pretrained_model_path "./log/Du
 python run_ttararec.py --dataset Amazon_Sports_and_Outdoors --pretrained_model_path "./log/DuoRec/Amazon_Sports_and_Outdoors/bs1024-lmd0.1-sem0.1-us_x-Sep-07-2025_18-38-29-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
 
 python run_ttararec.py --dataset Amazon_Beauty --pretrained_model_path "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Sep-17-2025_17-26-18-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
+python run_ttararec.py --dataset Amazon_Beauty --pretrained_model_path "./log/NewModel/Amazon_Beauty/bs256-lmdNone-semNone-None-Sep-22-2025_19-15-24-lr0.001-l20.0-tauNone-None-DPh0.5-DPaNone/model.pth"
+python run_newmodel.py 
