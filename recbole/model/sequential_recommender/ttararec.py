@@ -672,19 +672,19 @@ class TTARArec(SequentialRecommender):
             )
         
         # 区分不同预训练类型的评估路径
-        pm_type = None
-        if hasattr(self, 'config') and 'pretrained_model_type' in self.config:
-            pm_type = str(self.config['pretrained_model_type']).lower()
+        pm = self.pretrained_model
+        # 简单判断：有 mask_token 就按 BERT4Rec 处理，否则按普通模型
+        is_bert = hasattr(pm, 'mask_token')
 
-        if pm_type == 'bert4rec':
+        if is_bert:
             # BERT4Rec：去除mask列（仅[:n_items]），并加上输出偏置
-            test_items_emb = self.pretrained_model.item_embedding.weight[: self.n_items]
+            test_items_emb = pm.item_embedding.weight[: self.n_items]
             scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
-            output_bias = getattr(self.pretrained_model, 'output_bias', None)
+            output_bias = getattr(pm, 'output_bias', None)
             if output_bias is not None:
                 scores = scores + output_bias[: self.n_items]
         else:
-            # 其他（SASRec/DuoRec等）：使用完整embedding（包含padding对齐为0列，保持与原模型一致）
-            test_items_emb = self.pretrained_model.item_embedding.weight
+            # 其他（SASRec/DuoRec等）：使用完整embedding
+            test_items_emb = pm.item_embedding.weight
             scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
         return scores

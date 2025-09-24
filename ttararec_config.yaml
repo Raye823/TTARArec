@@ -8,21 +8,8 @@ model: TTARArec
 # ======================================
 pretrained_model_type: bert4rec  # 支持: duorec, sasrec
 pretrained_model_path: "./log/BERT4Rec/Amazon_Beauty/bs128-lmdNone-semNone-None-Sep-24-2025_13-53-05-lr0.001-l20.0-tauNone-None-DPh0.1-DPa0.5/model.pth"
+MAX_ITEM_LIST_LENGTH: 50
 
-# DuoRec特定参数
-lmd: 0.1
-lmd_sem: 0.2
-contrast: 'us_x'
-tau: 1.0
-sim: 'dot'
-
-# Transformer模型参数
-n_layers: 2
-n_heads: 2
-hidden_size: 64
-inner_size: 256
-hidden_dropout_prob: 0
-attn_dropout_prob: 0
 hidden_act: 'gelu'
 layer_norm_eps: 1e-12
 initializer_range: 0.02
@@ -51,7 +38,7 @@ NEG_PREFIX: neg_
 LABEL_FIELD: label
 ITEM_LIST_LENGTH_FIELD: item_length
 LIST_SUFFIX: _list
-MAX_ITEM_LIST_LENGTH: 50
+
 POSITION_FIELD: position_id
 
 min_user_inter_num: 5
