@@ -28,7 +28,7 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
     """
     # configurations initialization
     config = Config(model=model, dataset=dataset, config_file_list=config_file_list, config_dict=config_dict)
-    init_seed(config['seed'], config['reproducibility'])
+    # init_seed(config['seed'], config['reproducibility'])
 
     # logger initialization
     init_logger(config)
@@ -104,26 +104,6 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
         freq[i-1] = cnt[i]
     
     # freq /= freq.max()
-
-    sns.set(style='darkgrid')
-    sns.set_context("notebook", font_scale=1.8, rc={"lines.linewidth": 3, 'lines.markersize': 20})
-    plt.figure(figsize=(6, 4.5))
-    plt.scatter(proj[:, 0], proj[:, 1], s=1, c=freq, cmap='viridis_r')
-    plt.colorbar()
-    plt.xlim(-2, 2)
-    plt.ylim(-2, 2)
-    plt.savefig(log_dir + '/' + config['model'] + '-' + config['dataset'] + '.pdf', format='pdf', transparent=False, bbox_inches='tight')
-    
-    from scipy.linalg import svdvals
-    svs = svdvals(embedding_matrix)
-    svs /= svs.max()
-    np.save(log_dir + '/sv.npy', svs)
-
-    sns.set(style='darkgrid')
-    sns.set_context("notebook", font_scale=1.8, rc={"lines.linewidth": 3, 'lines.markersize': 20})
-    plt.figure(figsize=(6, 4.5))
-    plt.plot(svs)
-    plt.savefig(log_dir + '/svs.pdf', format='pdf', transparent=False, bbox_inches='tight')
 
     # model evaluation
     if config['model'] == 'RaSeRec':

@@ -32,6 +32,7 @@ train_batch_size: 256
 learner: adam
 learning_rate: 0.001
 train_neg_sample_args: None  # Use CE loss, no negative sampling needed
+training_neg_sample_num: 0
 eval_step: 1
 stopping_step: 10
 
@@ -57,7 +58,7 @@ min_item_inter_num: 5
 # environment settings
 gpu_id: '0'
 use_gpu: True
-seed: 200
+seed: 220
 state: INFO
 reproducibility: True
 data_path: './recbole/dataset/'

@@ -9,7 +9,7 @@ from recbole.data import create_dataset, data_preparation
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='NewModel', help='model name')
+    parser.add_argument('--model', type=str, default='SASRec', help='model name')
     parser.add_argument('--dataset', type=str, default='Amazon_Beauty', help='dataset name')
     parser.add_argument('--config_files', type=str, default='sasrec.yaml', help='config files')
     parser.add_argument('--saved', action='store_true', help='whether to save model')
@@ -19,7 +19,7 @@ def main():
 
     # config initialization
     config = Config(
-        model='NewModel', 
+        model='SASRec', 
         dataset=args.dataset,
         config_file_list=[args.config_files] if args.config_files else None
     )
@@ -52,7 +52,7 @@ def main():
     train_data, valid_data, test_data = data_preparation(config, dataset)
 
     # model loading and initialization via registry
-    model_cls = get_model('NewModel')
+    model_cls = get_model('SASRec')
     model = model_cls(config, train_data.dataset).to(config['device'])
     logger.info(model)
 

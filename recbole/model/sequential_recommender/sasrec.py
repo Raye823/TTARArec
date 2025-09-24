@@ -24,12 +24,12 @@ class PointWiseFeedForward(nn.Module):
         return outputs
 
 
-class NewModel(SequentialRecommender):
+class SASRec(SequentialRecommender):
 
     input_type = InputType.POINTWISE
 
     def __init__(self, config, dataset):
-        super(NewModel, self).__init__(config, dataset)
+        super(SASRec, self).__init__(config, dataset)
 
         # load dataset info
         self.n_users = dataset.user_num
