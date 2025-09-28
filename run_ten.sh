@@ -2,16 +2,17 @@
 set -euo pipefail
 
 # 可配置参数
-SCRIPT="run_sasrec.py"   
+SCRIPT="run_basic.py"         
+MODEL="SASRec"              
 DATASET="Amazon_Beauty"
-BASE_CFG="sasrec.yaml"    
+BASE_CFG="sasrec.yaml"  
 
 # 随机种子范围（更大范围与步长）
-START_SEED=100
-END_SEED=1000
-STEP=100
+START_SEED=200
+END_SEED=2000
+STEP=150
 
-echo "Running $SCRIPT on dataset=$DATASET with seeds ${START_SEED}..${END_SEED} step ${STEP}" 
+echo "Running $SCRIPT model=$MODEL dataset=$DATASET seeds ${START_SEED}..${END_SEED} step ${STEP}" 
 
 s=$START_SEED
 while [ $s -le $END_SEED ]; do
@@ -25,13 +26,18 @@ while [ $s -le $END_SEED ]; do
   fi
 
   echo "==> Seed ${s}"
-  echo "python ${SCRIPT} --dataset ${DATASET} --config_files ${TMP}"
-  python "$SCRIPT" --dataset "$DATASET" --config_files "$TMP"
+  echo "python ${SCRIPT} --model ${MODEL} --dataset ${DATASET} --config_files ${TMP}"
+  python "$SCRIPT" --model "$MODEL" --dataset "$DATASET" --config_files "$TMP"
 
   rm -f "$TMP"
   s=$(( s + STEP ))
 done
 
 echo "All runs completed."
+
+
+
+
+
 
 
