@@ -384,7 +384,42 @@ class SequentialFullDataLoader(NegSampleMixin, SequentialDataLoader):
         positive_idx = interaction[self.iid_field]
         scores_col_after = torch.cat((padding_idx, positive_idx))
         scores_col_before = torch.cat((positive_idx, padding_idx))
-        return interaction, None, scores_row, scores_col_after, scores_col_before
+        
+        # 🔧 关键修复：返回history_index用于评估时过滤已交互items
+        # 使用inter_matrix获取用户的历史交互items（根据mask过滤）
+        # 这对应TTA4SR中的 rating_pred[train_matrix > 0] = 0
+        
+        # 临时禁用logger警告（这个警告在我们的场景中是正常的）
+        import logging
+        logger = self.logger
+        original_level = logger.level
+        logger.setLevel(logging.ERROR)
+        
+        inter_matrix = self.dataset.inter_matrix(form='csr')
+        
+        # 恢复logger级别
+        logger.setLevel(original_level)
+        
+        user_ids = interaction[self.uid_field].cpu().numpy()
+        
+        # 为每个用户获取历史交互items，构造(row, col)索引对
+        row_indices = []
+        col_indices = []
+        for i, uid in enumerate(user_ids):
+            # 获取该用户的历史交互items（CSR格式的稀疏矩阵）
+            user_history = inter_matrix[uid].toarray().flatten().nonzero()[0]
+            # 为该用户的所有历史items构造索引
+            row_indices.extend([i] * len(user_history))
+            col_indices.extend(user_history.tolist())
+        
+        # 构造索引元组 (row_indices, col_indices)
+        # 用于 scores[history_index] = -np.inf
+        if len(row_indices) > 0:
+            history_index = (torch.LongTensor(row_indices), torch.LongTensor(col_indices))
+        else:
+            history_index = None
+        
+        return interaction, history_index, scores_row, scores_col_after, scores_col_before
 
     def get_pos_len_list(self):
         """

@@ -122,9 +122,9 @@ class PretrainedModelLoader:
             'lmd', 'lmd_sem', 'contrast', 'tau', 'sim'
         ],
         'sasrec': [
-            'n_layers', 'n_heads', 'hidden_size',
-            'hidden_dropout_prob', 'norm_first', 'hidden_act',
-            'initializer_range'
+            'n_layers', 'n_heads', 'hidden_size', 'inner_size',
+            'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
+            'layer_norm_eps', 'initializer_range', 'loss_type'
         ],
         'bert4rec': [
             'n_layers', 'n_heads', 'hidden_size', 'inner_size',

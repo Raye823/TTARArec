@@ -1,177 +1,233 @@
+# -*- coding: utf-8 -*-
+# @Time    : 2020/9/18 11:33
+# @Author  : Hui Wang
+# @Email   : hui.wang@ruc.edu.cn
+
+"""
+SASRec
+################################################
+
+Reference:
+    Wang-Cheng Kang et al. "Self-Attentive Sequential Recommendation." in ICDM 2018.
+
+Reference:
+    https://github.com/kang205/SASRec
+
+"""
+
 import torch
-import torch.nn as nn
+from torch import nn
 import numpy as np
 
-from recbole.utils import InputType
 from recbole.model.abstract_recommender import SequentialRecommender
+from recbole.model.layers import TransformerEncoder
 from recbole.model.loss import BPRLoss
-from recbole.model.init import xavier_normal_initialization
-
-
-class PointWiseFeedForward(nn.Module):
-    def __init__(self, hidden_units, dropout_rate):
-        super(PointWiseFeedForward, self).__init__()
-        
-        self.conv1 = nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout1 = nn.Dropout(p=dropout_rate)
-        self.relu = nn.ReLU()
-        self.conv2 = nn.Conv1d(hidden_units, hidden_units, kernel_size=1)
-        self.dropout2 = nn.Dropout(p=dropout_rate)
-
-    def forward(self, inputs):
-        outputs = self.dropout2(self.conv2(self.relu(self.dropout1(self.conv1(inputs.transpose(-1, -2))))))
-        outputs = outputs.transpose(-1, -2)  # as Conv1D requires (N, C, Length)
-        return outputs
 
 
 class SASRec(SequentialRecommender):
+    r"""
+    SASRec is the first sequential recommender based on self-attentive mechanism.
 
-    input_type = InputType.POINTWISE
+    NOTE:
+        In the author's implementation, the Point-Wise Feed-Forward Network (PFFN) is implemented
+        by CNN with 1x1 kernel. In this implementation, we follows the original BERT implementation
+        using Fully Connected Layer to implement the PFFN.
+    """
 
     def __init__(self, config, dataset):
         super(SASRec, self).__init__(config, dataset)
 
-        # load dataset info
-        self.n_users = dataset.user_num
-        self.n_items = dataset.item_num
+        # load parameters info
+        self.n_layers = config["n_layers"]
+        self.n_heads = config["n_heads"]
+        self.hidden_size = config["hidden_size"]  # same as embedding_size
+        self.inner_size = config[
+            "inner_size"
+        ]  # the dimensionality in feed-forward layer
+        self.hidden_dropout_prob = config["hidden_dropout_prob"]
+        self.attn_dropout_prob = config["attn_dropout_prob"]
+        self.hidden_act = config["hidden_act"]
+        self.layer_norm_eps = config["layer_norm_eps"]
 
-        # load parameters info - SASRec parameters
-        self.hidden_units = config['hidden_size'] if 'hidden_size' in config else 64
-        # Expose fields expected by TTARArec
-        self.hidden_size = self.hidden_units
-        self.hidden_act = config['hidden_act'] if 'hidden_act' in config else 'gelu'
-        self.initializer_range = config['initializer_range'] if 'initializer_range' in config else 0.02
-        self.num_heads = config['n_heads'] if 'n_heads' in config else 2
-        self.num_blocks = config['n_layers'] if 'n_layers' in config else 2
-        self.dropout_rate = config['hidden_dropout_prob'] if 'hidden_dropout_prob' in config else 0.5
-        self.max_len = config['MAX_ITEM_LIST_LENGTH'] if 'MAX_ITEM_LIST_LENGTH' in config else 50
-        self.norm_first = config['norm_first'] if 'norm_first' in config else True
+        self.initializer_range = config["initializer_range"]
+        self.loss_type = config["loss_type"]
 
-        # SASRec layers
-        self.item_emb = nn.Embedding(self.n_items, self.hidden_units, padding_idx=0)
-        # Alias expected by TTARArec
-        self.item_embedding = self.item_emb
-        self.pos_emb = nn.Embedding(self.max_len + 1, self.hidden_units, padding_idx=0)
-        self.emb_dropout = nn.Dropout(p=self.dropout_rate)
+        # define layers and loss
+        self.item_embedding = nn.Embedding(
+            self.n_items, self.hidden_size, padding_idx=0
+        )
+        self.position_embedding = nn.Embedding(self.max_seq_length, self.hidden_size)
+        self.trm_encoder = TransformerEncoder(
+            n_layers=self.n_layers,
+            n_heads=self.n_heads,
+            hidden_size=self.hidden_size,
+            inner_size=self.inner_size,
+            hidden_dropout_prob=self.hidden_dropout_prob,
+            attn_dropout_prob=self.attn_dropout_prob,
+            hidden_act=self.hidden_act,
+            layer_norm_eps=self.layer_norm_eps,
+        )
 
-        self.attention_layernorms = nn.ModuleList()
-        self.attention_layers = nn.ModuleList()
-        self.forward_layernorms = nn.ModuleList()
-        self.forward_layers = nn.ModuleList()
+        self.LayerNorm = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)
+        self.dropout = nn.Dropout(self.hidden_dropout_prob)
 
-        self.last_layernorm = nn.LayerNorm(self.hidden_units, eps=1e-8)
-
-        for _ in range(self.num_blocks):
-            new_attn_layernorm = nn.LayerNorm(self.hidden_units, eps=1e-8)
-            self.attention_layernorms.append(new_attn_layernorm)
-
-            new_attn_layer = nn.MultiheadAttention(
-                self.hidden_units,
-                self.num_heads,
-                self.dropout_rate,
-                batch_first=True
-            )
-            self.attention_layers.append(new_attn_layer)
-
-            new_fwd_layernorm = nn.LayerNorm(self.hidden_units, eps=1e-8)
-            self.forward_layernorms.append(new_fwd_layernorm)
-
-            new_fwd_layer = PointWiseFeedForward(self.hidden_units, self.dropout_rate)
-            self.forward_layers.append(new_fwd_layer)
-
-        # loss function (alias to match TTARArec usage)
-        self.loss_fct = nn.CrossEntropyLoss()
-        self.loss = self.loss_fct
+        if self.loss_type == "BPR":
+            self.loss_fct = BPRLoss()
+        elif self.loss_type == "CE":
+            self.loss_fct = nn.CrossEntropyLoss()
+        else:
+            raise NotImplementedError("Make sure 'loss_type' in ['BPR', 'CE']!")
 
         # parameters initialization
-        self.apply(xavier_normal_initialization)
+        self.apply(self._init_weights)
 
-    def log2feats(self, log_seqs):
-        """Convert item sequences to features using embeddings and positional encoding"""
-        seqs = self.item_emb(log_seqs)
-        seqs *= self.item_emb.embedding_dim ** 0.5
-        
-        # Create positional encoding
-        batch_size, seq_len = log_seqs.shape
-        poss = torch.arange(1, seq_len + 1, device=log_seqs.device).unsqueeze(0).expand(batch_size, -1).clone()
-        poss = poss * (log_seqs != 0)  # Mask padding positions
-        seqs += self.pos_emb(poss)
-        seqs = self.emb_dropout(seqs)
-
-        # Create attention mask for causality
-        tl = seqs.shape[1]
-        attention_mask = ~torch.tril(torch.ones((tl, tl), dtype=torch.bool, device=seqs.device))
-
-        # Apply transformer blocks
-        for i in range(len(self.attention_layers)):
-            if self.norm_first:
-                x = self.attention_layernorms[i](seqs)
-                mha_outputs, _ = self.attention_layers[i](x, x, x, attn_mask=attention_mask)
-                seqs = seqs + mha_outputs
-                seqs = seqs + self.forward_layers[i](self.forward_layernorms[i](seqs))
-            else:
-                mha_outputs, _ = self.attention_layers[i](seqs, seqs, seqs, attn_mask=attention_mask)
-                seqs = self.attention_layernorms[i](seqs + mha_outputs)
-                seqs = self.forward_layernorms[i](seqs + self.forward_layers[i](seqs))
-
-        log_feats = self.last_layernorm(seqs)
-        return log_feats
-
-    def encode(self, item_seq, item_seq_len):
-        """Encode sequence to a single vector [B, H] expected by TTARArec."""
-        # Note: item_seq_len is currently not used because we rely on padding mask inside
-        log_feats = self.log2feats(item_seq)
-        final_feat = log_feats[:, -1, :]
-        return final_feat
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.initializer_range)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
 
     def forward(self, item_seq, item_seq_len):
-        """Return sequence embedding [B, hidden_size] for TTARArec."""
-        return self.encode(item_seq, item_seq_len)
+        position_ids = torch.arange(
+            item_seq.size(1), dtype=torch.long, device=item_seq.device
+        )
+        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
+        position_embedding = self.position_embedding(position_ids)
 
-    def logits_from_seq(self, item_seq, item_seq_len):
-        final_feat = self.encode(item_seq, item_seq_len)  # [B, H]
-        all_item_embs = self.item_embedding.weight[1:]
-        logits = torch.matmul(final_feat, all_item_embs.T)
-        return logits
+        item_emb = self.item_embedding(item_seq)
+        input_emb = item_emb + position_embedding
+        input_emb = self.LayerNorm(input_emb)
+        input_emb = self.dropout(input_emb)
+
+        extended_attention_mask = self.get_attention_mask(item_seq)
+
+        trm_output = self.trm_encoder(
+            input_emb, extended_attention_mask, output_all_encoded_layers=True
+        )
+        output = trm_output[-1]
+        output = self.gather_indexes(output, item_seq_len - 1)
+        return output  # [B H]
+        
+    def get_attention_mask(self, item_seq):
+        """Generate left-to-right uni-directional attention mask for multi-head attention."""
+        attention_mask = (item_seq > 0).long()
+        extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # torch.int64
+        # mask for left-to-right unidirectional
+        max_len = attention_mask.size(-1)
+        attn_shape = (1, max_len, max_len)
+        subsequent_mask = torch.triu(torch.ones(attn_shape), diagonal=1)  # torch.uint8
+        subsequent_mask = (subsequent_mask == 0).unsqueeze(1)
+        subsequent_mask = subsequent_mask.long().to(item_seq.device)
+
+        extended_attention_mask = extended_attention_mask * subsequent_mask
+        extended_attention_mask = extended_attention_mask.to(dtype=next(self.parameters()).dtype)  # fp16 compatibility
+        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+        return extended_attention_mask
 
     def calculate_loss(self, interaction):
-        """Calculate Cross Entropy loss"""
-        item_seq = interaction[self.ITEM_SEQ]
-        item_seq_len = interaction[self.ITEM_SEQ_LEN] if self.ITEM_SEQ_LEN in interaction else None
-        logits = self.logits_from_seq(item_seq, item_seq_len)
-        pos_items = interaction[self.POS_ITEM_ID]
-        loss = self.loss_fct(logits, pos_items - 1)
+        """Calculate loss - 完全对齐 TTA4SR（对所有位置计算损失）
+        
+        TTA4SR 训练方式:
+        - input_ids:  [i1, i2, i3, i4]
+        - target_pos: [i2, i3, i4, i5]  # 右移一位
+        - 对每个位置都计算损失
+        """
+        item_seq = interaction[self.ITEM_SEQ]  # [B, L]
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]  # [B]
+        pos_item = interaction[self.POS_ITEM_ID]  # [B]
+        
+        # 获取所有位置的输出 [B, L, H]
+        position_ids = torch.arange(item_seq.size(1), dtype=torch.long, device=item_seq.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(item_seq)
+        position_embedding = self.position_embedding(position_ids)
+
+        item_emb = self.item_embedding(item_seq)
+        input_emb = item_emb + position_embedding
+        input_emb = self.LayerNorm(input_emb)
+        input_emb = self.dropout(input_emb)
+
+        extended_attention_mask = self.get_attention_mask(item_seq)
+        trm_output = self.trm_encoder(input_emb, extended_attention_mask, output_all_encoded_layers=True)
+        sequence_output = trm_output[-1]  # [B, L, H]
+        
+        batch_size, seq_len = item_seq.shape
+        
+        # 🔧 构造所有位置的 targets (对齐 TTA4SR)
+        # target_pos[i] = input_ids[i+1]
+        pos_targets = torch.zeros_like(item_seq)  # [B, L]
+        
+        for b in range(batch_size):
+            actual_len = item_seq_len[b].item()
+            if actual_len > 0:
+                # 复制右移的序列
+                if actual_len > 1:
+                    pos_targets[b, :actual_len-1] = item_seq[b, 1:actual_len]
+                # 最后一个有效位置的 target 是 pos_item
+                pos_targets[b, actual_len-1] = pos_item[b]
+        
+        # 负采样：为每个有效位置采样负样本
+        neg_targets = torch.zeros_like(pos_targets)
+        
+        for b in range(batch_size):
+            actual_len = item_seq_len[b].item()
+            if actual_len > 0:
+                # 用户的完整序列（包括 target）
+                user_hist = set(item_seq[b, :actual_len].cpu().tolist())
+                user_hist.add(pos_item[b].item())
+                
+                # 为每个有效位置采样
+                for i in range(actual_len):
+                    while True:
+                        neg = np.random.randint(1, self.n_items)
+                        if neg not in user_hist:
+                            neg_targets[b, i] = neg
+                            break
+        
+        neg_targets = neg_targets.to(item_seq.device)
+        
+        # 计算损失 (与 TTA4SR trainers.py cross_entropy 完全一致)
+        pos_emb = self.item_embedding(pos_targets)  # [B, L, H]
+        neg_emb = self.item_embedding(neg_targets)  # [B, L, H]
+        
+        # Flatten to [B*L, H]
+        seq_emb = sequence_output.reshape(-1, self.hidden_size)
+        pos = pos_emb.reshape(-1, self.hidden_size)
+        neg = neg_emb.reshape(-1, self.hidden_size)
+        
+        # Compute logits [B*L]
+        pos_logits = torch.sum(pos * seq_emb, dim=-1)
+        neg_logits = torch.sum(neg * seq_emb, dim=-1)
+        
+        # Mask: 只在有效位置计算损失
+        istarget = (pos_targets > 0).reshape(-1).float()  # [B*L]
+        
+        # Loss (与 TTA4SR 完全一致)
+        loss = torch.sum(
+            - torch.log(torch.sigmoid(pos_logits) + 1e-24) * istarget -
+            torch.log(1 - torch.sigmoid(neg_logits) + 1e-24) * istarget
+        ) / (torch.sum(istarget) + 1e-8)
+        
         return loss
 
     def predict(self, interaction):
-        """Predict scores for given user-item pairs"""
         item_seq = interaction[self.ITEM_SEQ]
-        item = interaction[self.ITEM_ID]
-        
-        final_feat = self.encode(item_seq, None)
-        item_emb = self.item_embedding(item)  # [batch_size, hidden_units]
-        scores = (final_feat * item_emb).sum(dim=-1)  # [batch_size]
-        
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        test_item = interaction[self.ITEM_ID]
+        seq_output = self.forward(item_seq, item_seq_len)
+        test_item_emb = self.item_embedding(test_item)
+        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
         return scores
 
     def full_sort_predict(self, interaction):
-        """Predict scores for all items for given users"""
         item_seq = interaction[self.ITEM_SEQ]
-        
-        final_feat = self.encode(item_seq, None)
-        # Get all item embeddings except padding id 0
-        valid_item_embs = self.item_embedding.weight[1:]  # [n_items-1, hidden_units]
-        
-        # Calculate scores for valid items
-        scores_valid = torch.matmul(final_feat, valid_item_embs.T)  # [batch_size, n_items-1]
-        
-        # Prepend a padding column for item id 0 to match framework's tot_item_num
-        pad_col = torch.full(
-            (scores_valid.size(0), 1),
-            fill_value=-1e9,
-            device=scores_valid.device,
-            dtype=scores_valid.dtype,
-        )
-        scores = torch.cat([pad_col, scores_valid], dim=1)  # [batch_size, n_items]
-        
+        item_seq_len = interaction[self.ITEM_SEQ_LEN]
+        seq_output = self.forward(item_seq, item_seq_len)
+        test_items_emb = self.item_embedding.weight
+        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B n_items]
         return scores

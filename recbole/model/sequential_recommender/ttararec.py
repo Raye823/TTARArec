@@ -23,6 +23,7 @@ from torch import nn
 import numpy as np
 from recbole.model.abstract_recommender import SequentialRecommender
 from recbole.model.layers import activation_layer, CrossMultiHeadAttention, FeedForward
+from recbole.model.loss import BPRLoss
 from recbole.model.sequential_recommender.pretrained_model_loader import PretrainedModelLoader
 import torch.nn.functional as F
 from recbole.utils.ttararec_diagnostics import compute_retrieval_effectiveness_vectorized, print_diagnostic_info_optimized
@@ -42,16 +43,21 @@ class TTARArec(SequentialRecommender):
     def __init__(self, config, dataset):
         super(TTARArec, self).__init__(config, dataset)
 
-        # ========== 1. 加载预训练模型 ==========
+        # ========== 1. 保存用户指定的loss_type（在加载预训练模型之前） ==========
+        user_specified_loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
+        
+        # ========== 2. 加载预训练模型 ==========
         self.pretrained_model = PretrainedModelLoader.load_model(config, dataset)
         self.pretrained_model.requires_grad_(False)
         
-        # ========== 2. 从预训练模型获取基础架构参数 ==========
+        # ========== 3. 从预训练模型获取基础架构参数 ==========
         self.hidden_size = self.pretrained_model.hidden_size
         self.hidden_act = getattr(self.pretrained_model, 'hidden_act', config['hidden_act'] if 'hidden_act' in config else 'gelu')
         self.initializer_range = config['initializer_range']
-        # 损失类型（CE 或 BPR）
-        self.loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
+        
+        # 🔧 关键修复：使用用户指定的loss_type，不被预训练模型覆盖
+        self.loss_type = user_specified_loss_type
+        print(f"[INFO] TTARArec使用loss_type: {self.loss_type} (预训练模型的loss_type已被忽略)")
         self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
         # 定义损失函数
         if self.loss_type == 'BPR':
@@ -211,7 +217,7 @@ class TTARArec(SequentialRecommender):
         """检索相似序列和对应的目标物品ID以及原始交互序列（基于q检索）"""
         queries_cpu = queries.detach().cpu().numpy()
         normalize_L2(queries_cpu)
-        _, I1 = self.seq_emb_index.search(queries_cpu, 4 * topk)
+        _, I1 = self.seq_emb_index.search(queries_cpu, 8 * topk)
         
         # 过滤掉同用户的相同长度序列
         I1_filtered = []
@@ -258,9 +264,15 @@ class TTARArec(SequentialRecommender):
     
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
         batch_size = pos_items.size(0)
-        n_retrieved = enhanced_sequences.size(1) 
+        
+        
+        n_retrieved = enhanced_sequences.size(1) if enhanced_sequences is not None else 1
         pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
         all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
+        
+        # 默认值
+        tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1.0
+        logits = None
 
         if enhanced_sequences is not None:
             if self.loss_type == 'CE':
@@ -276,7 +288,7 @@ class TTARArec(SequentialRecommender):
                 ).reshape(batch_size, n_retrieved)  # [B, K]
                 
                 logits = -ce_losses_k  # 损失越小越好，转为正分数
-                tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1
+            
         return torch.softmax(logits / max(tau, 1e-6), dim=1).detach()
 
     def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
@@ -333,10 +345,19 @@ class TTARArec(SequentialRecommender):
             
         # 计算推荐损失（支持CE/BPR）
         if self.loss_type == 'CE':
-            # 默认回退CE
+            # CE损失：使用全库logits
             test_item_emb = self.pretrained_model.item_embedding.weight
-            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))
-            rec_loss = self.pretrained_model.loss_fct(logits, pos_items)
+            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))  # [B, N]
+            rec_loss = self.loss_fct(logits, pos_items)  # 使用TTARArec自己的loss_fct
+        else:
+            # BPR损失：需要负采样
+            pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
+            # 简单负采样
+            neg_items = torch.randint(1, self.n_items, (pos_items.size(0),), device=pos_items.device)
+            neg_items_emb = self.get_item_embedding(neg_items)  # [B, H]
+            pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
+            neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
+            rec_loss = self.loss_fct(pos_score, neg_score)
 
         # 计算检索评分：使用预计算的增强序列表征
 
