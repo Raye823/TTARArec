@@ -1,0 +1,81 @@
+# GRU4Rec Configuration
+# model config - 严格按照原始参数
+embedding_size: 64         # (int) layers=[100] -> 单层100维GRU
+hidden_size: 128           # (int) 对应layers[0]=100
+num_layers: 1              # (int) len(layers)=1, 单层GRU
+dropout_prob: 0.3          # (float) dropout_p_hidden=0.4
+loss_type: CE              # (str) loss='cross-entropy'
+
+# 严格对应的原始参数值:
+# embedding: 0 -> 不使用预训练embedding，用GRU自带机制
+# dropout_p_embed: 0.0 -> embedding层dropout为0
+# constrained_embedding: True -> 约束嵌入模式
+# n_sample: 2048, sample_alpha: 0.5 -> 负采样参数
+# bpreg: 0.0, logq: 1.0 -> BPR正则化参数
+# elu_param: 0 -> ELU参数
+
+# dataset config
+field_separator: "\t"
+seq_separator: " "
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+RATING_FIELD: rating
+TIME_FIELD: timestamp
+NEG_PREFIX: neg_
+LABEL_FIELD: label
+ITEM_LIST_LENGTH_FIELD: item_length
+LIST_SUFFIX: _list
+MAX_ITEM_LIST_LENGTH: 50
+POSITION_FIELD: position_id
+
+# data loading
+load_col:
+    inter: [user_id, item_id, rating, timestamp]
+
+# training settings
+epochs: 100                 # (int) n_epochs from your config
+train_batch_size: 32     # (int) batch_size from your config
+learner: sgd               # Using SGD to match momentum config
+learning_rate: 0.2         # (float) learning_rate from your config
+momentum: 0.2              # (float) momentum from your config
+train_neg_sample_args: null # Use CE loss, no negative sampling needed
+training_neg_sample_num: 0
+eval_step: 1
+stopping_step: 20
+
+# evaluation settings
+eval_args:
+    split: {'LS': 'valid_and_test'}
+    order: TO
+    group_by: user
+    mode: full
+repeatable: True
+metrics: ['Recall', 'NDCG']
+topk: [5, 10, 20]
+valid_metric: NDCG@10
+valid_metric_bigger: True
+eval_batch_size: 256
+metric_decimal_place: 4
+
+# disable filtering to use all data
+user_inter_num_interval: "[5,inf)"
+item_inter_num_interval: "[5,inf)"
+min_user_inter_num: 5
+min_item_inter_num: 5
+# environment settings
+gpu_id: '0'
+use_gpu: True
+seed: 2020
+state: INFO
+reproducibility: True
+data_path: './recbole/dataset/'
+checkpoint_dir: 'saved'
+show_progress: True
+
+# Additional notes:
+# - constrained_embedding: handled by padding_idx=0 in embedding layer
+# - embedding=0: using learned embeddings (not pre-trained)
+# - elu_param=0: not applicable to GRU4Rec architecture
+# - momentum: using Adam optimizer instead of SGD+momentum
+# - n_sample, sample_alpha, bpreg, logq: specific to original GRU4Rec implementation,
+#   not directly supported in RecBole's version
