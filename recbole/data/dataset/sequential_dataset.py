@@ -40,43 +40,28 @@ class SequentialDataset(Dataset):
 
     def prepare_data_augmentation(self):
         """Augmentation processing for sequential dataset.
-
-        For SASRec model: Align with TTA4SR - each user generates exactly 3 samples.
-        For other models: Use original data augmentation strategy.
-        
-        TTA4SR style (for user with sequence [i1, i2, i3, i4, i5, i6, i7]):
         - Train sample:  input=[i1, i2, i3, i4]       target=i5  (items[:-3] -> target=items[-3])
         - Valid sample:  input=[i1, i2, i3, i4, i5]    target=i6  (items[:-2] -> target=items[-2])
         - Test sample:   input=[i1, i2, i3, i4, i5, i6] target=i7  (items[:-1] -> target=items[-1])
 
         Each user sequence generates EXACTLY 3 samples, no sliding window.
         """
-        # 检查模型类型
         model_name = self.config['model'].lower()
         
         if model_name == 'sasrec':
-            self.logger.debug('prepare_data_augmentation - ttararec)')
             self._prepare_ttararec_augmentation()
         elif model_name == 'ttararec':
             self.logger.debug('prepare_data_augmentation - ttararec)')
             self._prepare_ttararec_augmentation()
         else:
-            self.logger.debug('prepare_data_augmentation - 原始模式')
+            self.logger.debug('prepare_data_augmentation - original')
             self._prepare_original_augmentation()
 
     def _prepare_ttararec_augmentation(self):
-        """每个用户固定生成最后生成3个样本，不使用滑动窗口
-        
-        核心差异：
-        1. 不使用滑动窗口
-        2. 每个用户固定生成3个样本用于train/valid/test
-        3. 这样训练样本数 = 用户数（而非滑动窗口的N倍）
-        """
         self._check_field('uid_field', 'time_field')
         max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']
         self.sort(by=[self.uid_field, self.time_field], ascending=True)
-        
-        # 按用户分组，收集每个用户的所有交互索引
+
         user_interactions = {}
         for i, uid in enumerate(self.inter_feat[self.uid_field].numpy()):
             if uid not in user_interactions:
@@ -87,31 +72,18 @@ class SequentialDataset(Dataset):
         
         for uid, indices in user_interactions.items():
             seq_len = len(indices)
-            
-            # 至少需要5个交互才能生成3个样本 (train需要至少4个历史+1个target)
-            if seq_len < 5:
-                self.logger.debug(f'用户 {uid} 交互数不足5，跳过')
+            if seq_len < 4:
                 continue
             
-            # 🔧 对齐TTA4SR: 生成恰好3个样本
-            # Sample 1 (for train): input=indices[:-3], target=indices[-3]
-            # Sample 2 (for valid): input=indices[:-2], target=indices[-2]  
-            # Sample 3 (for test):  input=indices[:-1], target=indices[-1]
-            
             for offset in [3, 2, 1]:
-                # target是倒数第offset个
                 target_idx = indices[-offset]
                 
-                # input是从开始到target之前的所有
-                input_len = len(indices) - offset  # indices[:-offset]的长度
-                
-                # 如果input序列太长，截取最后max_item_list_len个
+                input_len = len(indices) - offset 
+
                 if input_len > max_item_list_len:
-                    # 取最后max_item_list_len个作为输入
                     seq_start = indices[input_len - max_item_list_len]
                     seq_end = target_idx
                 else:
-                    # 序列不长，全部作为输入
                     seq_start = indices[0]
                     seq_end = target_idx
                 
@@ -127,11 +99,9 @@ class SequentialDataset(Dataset):
         self.mask = np.ones(len(self.inter_feat), dtype=np.bool_)
         
         num_users = len(user_interactions)
-        self.logger.info(f'TTA4SR对齐数据增强完成: {num_users}个用户 -> {len(self.uid_list)}个样本 (每用户3个)')
-        self.logger.info(f'平均每用户样本数: {len(self.uid_list) / max(num_users, 1):.2f}')
+
 
     def _prepare_original_augmentation(self):
-        """原始的数据增强策略：保持兼容性"""
         self._check_field('uid_field', 'time_field')
         max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']
         self.sort(by=[self.uid_field, self.time_field], ascending=True)
@@ -162,10 +132,8 @@ class SequentialDataset(Dataset):
         if os.path.exists(aug_path):
             same_target_index = np.load(aug_path, allow_pickle=True)
         else:
-            print(f"[DEBUG] 开始语义增强计算，target_index长度: {len(target_index)}")
             target_item = self.inter_feat['item_id'][target_index].numpy()
             
-            # 优化版本：使用字典预分组，避免O(n²)复杂度
             item_to_indices = {}
             for index, item_id in enumerate(target_item):
                 if item_id not in item_to_indices:
@@ -175,12 +143,10 @@ class SequentialDataset(Dataset):
             same_target_index = []
             for index, item_id in enumerate(target_item):
                 all_indices = item_to_indices[item_id]
-                # 移除当前索引
                 same_indices = [idx for idx in all_indices if idx != index]
                 same_target_index.append(np.array(same_indices))
             
             same_target_index = np.array(same_target_index, dtype=object)
-            print(f"[DEBUG] 语义增强计算完成，保存到: {aug_path}")
             np.save(aug_path, same_target_index)
         
         return same_target_index
@@ -204,21 +170,11 @@ class SequentialDataset(Dataset):
                 setattr(ds, field, np.array(getattr(ds, field)[index]))
             setattr(ds, 'mask', np.ones(len(self.inter_feat), dtype=np.bool_))
             next_ds.append(ds)
-        
-        # 🔧 对齐TTA4SR的mask逻辑：
-        # TTA4SR中:
-        #   Valid时: train_matrix=items[:-2]，过滤items[:-2]，评估items[-2]
-        #   Test时:  train_matrix=items[:-1]，过滤items[:-1]，评估items[-1]
-        
-        # Train dataset: mask掉valid和test的targets
+
         next_ds[0].mask[self.target_index[next_index[1] + next_index[2]]] = False
         
-        # Valid dataset: 也mask掉valid和test的targets（关键！）
-        # 这样inter_matrix=items[:-2]，评估items[-2]时不会被过滤
         next_ds[1].mask[self.target_index[next_index[1] + next_index[2]]] = False
-        
-        # Test dataset: 只mask掉test的target
-        # 这样inter_matrix=items[:-1]，评估items[-1]时不会被过滤
+
         next_ds[2].mask[self.target_index[next_index[2]]] = False
         
         # semantic augmentation for training and only for the train dataset

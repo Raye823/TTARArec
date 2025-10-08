@@ -26,7 +26,6 @@ from recbole.model.layers import activation_layer, CrossMultiHeadAttention, Feed
 from recbole.model.loss import BPRLoss
 from recbole.model.sequential_recommender.pretrained_model_loader import PretrainedModelLoader
 import torch.nn.functional as F
-from recbole.utils.ttararec_diagnostics import compute_retrieval_effectiveness_vectorized, print_diagnostic_info_optimized
 
 
 class TTARArec(SequentialRecommender):
@@ -75,8 +74,15 @@ class TTARArec(SequentialRecommender):
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
-        # 检索评分负信号配置
-        self.retrieval_num_negatives = config['retrieval_num_negatives'] if 'retrieval_num_negatives' in config else 3
+
+        # 熵计算参数：控制熵只对召回的最相似的top-n个物品计算
+        # entropy_topn为百分比（如0.01表示1%），-1表示对全库物品计算
+        entropy_topn_ratio = config['entropy_topn'] if 'entropy_topn' in config else -1
+        if entropy_topn_ratio == -1:
+            self.entropy_topn = -1  # 对全库物品计算
+        else:
+            # 将百分比转换为实际的物品数量
+            self.entropy_topn = max(1, int(self.n_items * entropy_topn_ratio))
 
         # ========== 4. 设置训练相关参数 ==========
         # 损失权重
@@ -246,8 +252,16 @@ class TTARArec(SequentialRecommender):
 
     def compute_entropy(self, logits):
         """计算logits的熵"""
-        probs = F.softmax(logits, dim=-1)
-        entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+        if self.entropy_topn == -1:
+            probs = F.softmax(logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
+        else:
+            # 只对召回的最相似的top-n个物品计算熵（n为数据集总item数的百分比）
+            # 获取top-n个最大的logits
+            topn_logits, _ = torch.topk(logits, k=min(self.entropy_topn, logits.size(-1)), dim=-1)
+            # 对top-n个logits计算softmax和熵
+            probs = F.softmax(topn_logits, dim=-1)
+            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=-1)
         return entropy
     
     def compute_alpha_weights(self, logits1, logits2):
@@ -264,15 +278,9 @@ class TTARArec(SequentialRecommender):
     
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
         batch_size = pos_items.size(0)
-        
-        
-        n_retrieved = enhanced_sequences.size(1) if enhanced_sequences is not None else 1
+        n_retrieved = enhanced_sequences.size(1) 
         pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
         all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
-        
-        # 默认值
-        tau = float(getattr(self, 'retrieval_tau', 1.0)) if hasattr(self, 'retrieval_tau') else 1.0
-        logits = None
 
         if enhanced_sequences is not None:
             if self.loss_type == 'CE':
@@ -288,8 +296,7 @@ class TTARArec(SequentialRecommender):
                 ).reshape(batch_size, n_retrieved)  # [B, K]
                 
                 logits = -ce_losses_k  # 损失越小越好，转为正分数
-            
-        return torch.softmax(logits / max(tau, 1e-6), dim=1).detach()
+        return torch.softmax(logits / 0.01, dim=1).detach()
 
     def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
         """计算注意力评分 - 使用nn.MultiheadAttention提取注意力权重"""
@@ -374,27 +381,6 @@ class TTARArec(SequentialRecommender):
         # 计算KL散度损失（注意力评分向检索评分对齐）
         kl_loss = self.compute_kl_loss(attention_probs, retrieval_probs)
 
-        # ============ 诊断信息输出 ============
-    
-        # 每33个batch输出一次诊断信息
-        if hasattr(self, 'batch_count'):
-            self.batch_count += 1
-        else:
-            self.batch_count = 0
-            
-        if self.batch_count % 129 == 0:
-            # 计算检索效果指标
-            retrieval_effectiveness, augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency = compute_retrieval_effectiveness_vectorized(self,
-                retrieved_item_seqs, pos_items, item_seq, item_seq_len, batch_seq_len, retrieved_seqs, retrieved_tar_items, enhanced_sequences
-            )
-            
-            print_diagnostic_info_optimized(self,
-                rec_loss, kl_loss, retrieval_probs, attention_probs, 
-                seq_output, seq_output_aug, pos_items, retrieval_effectiveness, 
-                augment_retrieval_consistency, fusion_retrieval_consistency, top_retrieval_similarity, augment_fusion_consistency,
-            )
-        
-        # 总损失 = KL散度损失 * 权重 + 推荐损失 * 权重
         total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         
         return total_loss
@@ -692,20 +678,8 @@ class TTARArec(SequentialRecommender):
                 seq_output, batch_user_id, batch_seq_len, mode="test"
             )
         
-        # 区分不同预训练类型的评估路径
-        pm = self.pretrained_model
-        # 简单判断：有 mask_token 就按 BERT4Rec 处理，否则按普通模型
-        is_bert = hasattr(pm, 'mask_token')
-
-        if is_bert:
-            # BERT4Rec：去除mask列（仅[:n_items]），并加上输出偏置
-            test_items_emb = pm.item_embedding.weight[: self.n_items]
-            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
-            output_bias = getattr(pm, 'output_bias', None)
-            if output_bias is not None:
-                scores = scores + output_bias[: self.n_items]
-        else:
-            # 其他（SASRec/DuoRec等）：使用完整embedding
-            test_items_emb = pm.item_embedding.weight
-            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+        # 计算与所有物品的得分
+        test_items_emb = self.pretrained_model.item_embedding.weight
+        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+        
         return scores

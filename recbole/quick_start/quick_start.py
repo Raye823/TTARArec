@@ -47,21 +47,8 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
     # dataset splitting
     train_data, valid_data, test_data = data_preparation(config, dataset)
 
-    # model loading and initialization
+    # model 
     model = get_model(config['model'])(config, train_data).to(config['device'])
-    if "pre_training_ckt" in config:
-        checkpoint = torch.load(config['pre_training_ckt'])
-        # 使用非严格模式加载，允许缺少新添加组件的权重
-        model.load_state_dict(checkpoint['state_dict'], strict=False)
-        
-        # 如果是RaSeRec模型，显式初始化RetrieverEncoder组件
-        if config['model'] == 'RaSeRec' and hasattr(model, 'init_retriever_encoder'):
-            model.init_retriever_encoder()
-
-    # 对于其他模型，如果有precached_knowledge方法，则调用
-    elif hasattr(model, 'precached_knowledge'):
-        model.precached_knowledge()
-        
     logger.info(model)
     
     # trainer loading and initialization
