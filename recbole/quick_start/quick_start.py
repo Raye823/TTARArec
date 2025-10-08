@@ -57,18 +57,7 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
         # 如果是RaSeRec模型，显式初始化RetrieverEncoder组件
         if config['model'] == 'RaSeRec' and hasattr(model, 'init_retriever_encoder'):
             model.init_retriever_encoder()
-    
-    # 只有在使用RaSeRec模型时才调用presetting_ram方法
-    if config['model'] == 'RaSeRec':
-        model.presetting_ram()
-        model.precached_knowledge()
-        
-        # 仅对RaSeRec模型应用梯度设置
-        for name, param in model.named_parameters():
-            if 'seq_tar_ram' not in name and 'tar_seq_ram' not in name:
-                param.requires_grad = False
-            else:
-                param.requires_grad = True
+
     # 对于其他模型，如果有precached_knowledge方法，则调用
     elif hasattr(model, 'precached_knowledge'):
         model.precached_knowledge()
