@@ -26,8 +26,8 @@ import torch
 from recbole.model.sequential_recommender.duorec import DuoRec
 from recbole.model.sequential_recommender.sasrec import SASRec
 from recbole.model.sequential_recommender.bert4rec import BERT4Rec
+from recbole.model.sequential_recommender.gru4rec import GRU4Rec
 from torch import nn
-import torch
 
 
 class BERT4RecAdapter(nn.Module):
@@ -111,6 +111,7 @@ class PretrainedModelLoader:
         'duorec': DuoRec,
         'sasrec': SASRec,
         'bert4rec': BERT4Rec,
+        'gru4rec': GRU4Rec,
     }
     
     # 每个模型的架构参数
@@ -130,6 +131,10 @@ class PretrainedModelLoader:
             'n_layers', 'n_heads', 'hidden_size', 'inner_size',
             'hidden_dropout_prob', 'attn_dropout_prob', 'hidden_act',
             'layer_norm_eps', 'initializer_range', 'mask_ratio', 'loss_type'
+        ],
+        'gru4rec': [
+            'embedding_size', 'hidden_size', 'num_layers',
+            'dropout_prob', 'loss_type'
         ]
     }
     
@@ -256,4 +261,18 @@ class PretrainedModelLoader:
             加载好的BERT4Rec模型实例
         """
         return PretrainedModelLoader.load_model(config, dataset, 'bert4rec')
+    
+    @staticmethod
+    def load_gru4rec_model(config, dataset):
+        """
+        加载GRU4Rec预训练模型
+        
+        Args:
+            config: 配置字典
+            dataset: 数据集对象
+            
+        Returns:
+            加载好的GRU4Rec模型实例
+        """
+        return PretrainedModelLoader.load_model(config, dataset, 'gru4rec')
     
