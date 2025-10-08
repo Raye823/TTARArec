@@ -24,21 +24,6 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     init_logger(config)
     logger = getLogger()
     
-    # 配置TTARArec专用日志器，复用当前run的log.txt
-    import logging
-    tt_logger = logging.getLogger("TTARArec")
-    tt_logger.setLevel(logging.INFO)
-    tt_logger.propagate = False
-    # 从当前logger获取文件路径
-    if logger.handlers:
-        for h in logger.handlers:
-            if hasattr(h, 'baseFilename'):
-                fh = logging.FileHandler(h.baseFilename, mode="a", encoding="utf-8")
-                fh.setLevel(logging.INFO)
-                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s", datefmt="%y-%m-%d %H:%M"))
-                tt_logger.addHandler(fh)
-                break
-    
     # 获取日志目录
     import os
     log_dir = os.path.dirname(logger.handlers[0].baseFilename)
@@ -67,26 +52,18 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     logger.info(f"KL散度损失权重: {config['kl_weight']}")
     
     logger.info(model)
-    
     # 初始化TTARArec的知识库
     logger.info("正在构建TTARArec检索知识库...")
-    try:
-        model.precached_knowledge()
-        logger.info("检索知识库构建完成!")
-    except Exception as e:
-        logger.error(f"构建检索知识库时出错: {e}")
-        raise e
-    
+    model.precached_knowledge()
+    logger.info("检索知识库构建完成!")
+
     # 加载trainer
     trainer = get_trainer(config['MODEL_TYPE'], config['model'])(config, model)
     
     # 在训练前进行一次评估
 
     valid_score, valid_result = trainer._valid_epoch(valid_data, show_progress=config['show_progress'])
-    logger.info(set_color('初始验证结果', 'blue') + f': {valid_score}')
     logger.info(set_color('详细验证结果', 'blue') + f': {valid_result}')
-        
-    # 测试集评估
     test_result = trainer.evaluate(test_data, load_best_model=False, show_progress=config['show_progress'])
     logger.info(set_color('初始测试结果', 'blue') + f': {test_result}')
 

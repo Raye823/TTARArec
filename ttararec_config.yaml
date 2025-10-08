@@ -1,26 +1,18 @@
-# ======================================
-# Model Specification
-# ======================================
 model: TTARArec
-
 # ======================================
 # Pretrained Model Configuration
 # ======================================
 pretrained_model_type: duorec  # 支持: duorec, sasrec
 pretrained_model_path: "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Sep-24-2025_20-27-58-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
 MAX_ITEM_LIST_LENGTH: 50
-
 hidden_act: 'gelu'
 layer_norm_eps: 1e-12
 initializer_range: 0.02
-loss_type: 'CE'
-training_neg_sample_num: 0
 # ======================================
 # Directory Settings
 # ======================================
 log_root: "./log/"
 data_path: "./recbole/dataset"
-
 # ======================================
 # Dataset Configuration
 # ======================================
@@ -30,20 +22,15 @@ USER_ID_FIELD: user_id
 ITEM_ID_FIELD: item_id
 RATING_FIELD: rating
 TIME_FIELD: timestamp
-
 load_col:
     inter: [user_id, item_id, rating, timestamp]
-
 NEG_PREFIX: neg_
 LABEL_FIELD: label
 ITEM_LIST_LENGTH_FIELD: item_length
 LIST_SUFFIX: _list
-
 POSITION_FIELD: position_id
-
 min_user_inter_num: 5
 min_item_inter_num: 5
-
 # ======================================
 # Training Settings
 # ======================================
@@ -54,7 +41,8 @@ learning_rate: 0.001
 eval_step: 1
 stopping_step: 10
 weight_decay: 0
-
+loss_type: 'CE'
+training_neg_sample_num: 0
 # ======================================
 # Evaluation Settings
 # ======================================
@@ -63,7 +51,6 @@ eval_setting: TO_LS,full
 metrics: ["Recall", "NDCG","MRR"]
 valid_metric: NDCG@10
 topk: [5, 10, 20, 50]
-
 # ======================================
 # TTARArec Retrieval Augmentation Parameters
 # ======================================
@@ -73,14 +60,6 @@ low_popular: 100                 # Low popularity threshold, use augmentation fo
 len_lower_bound: -1              # Sequence length lower bound, -1 means no limit
 len_upper_bound: -1              # Sequence length upper bound, -1 means no limit
 len_bound_reverse: False          # Whether to reverse length filtering condition
-
-# ======================================
-# Retriever Encoder Parameters
-# ======================================
-retriever_layers: 0              # Number of retriever MLP layers
-retriever_dropout: 0           # Retriever dropout rate
-
-
 # ======================================
 # Cross-Attention Fusion Mechanism Parameters (Independent of Pretrained Model)
 # ======================================
@@ -88,11 +67,8 @@ fusion_n_heads: 1               # Number of cross-attention heads
 fusion_inner_size: 256          # Cross-attention FFN inner dimension
 fusion_dropout_prob: 0        # Cross-attention dropout probability
 fusion_layer_norm_eps: 1e-12    # Cross-attention LayerNorm epsilon
-
 # ======================================
 # Loss Function and Fusion Weight Parameters
 # ======================================
 kl_loss_weight:  0.2            # KL divergence loss weight
-
-# ======================================
 entropy_topn: 0.01

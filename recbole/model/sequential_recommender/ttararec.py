@@ -59,10 +59,7 @@ class TTARArec(SequentialRecommender):
         print(f"[INFO] TTARArec使用loss_type: {self.loss_type} (预训练模型的loss_type已被忽略)")
         self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
         # 定义损失函数
-        if self.loss_type == 'BPR':
-            self.loss_fct = BPRLoss()
-        else:
-            self.loss_fct = nn.CrossEntropyLoss()
+        self.loss_fct = nn.CrossEntropyLoss()
 
         # ========== 3. 设置检索相关参数 ==========
         # 检索配置参数
@@ -74,23 +71,18 @@ class TTARArec(SequentialRecommender):
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
-
-        # 熵计算参数：控制熵只对召回的最相似的top-n个物品计算
-        # entropy_topn为百分比（如0.01表示1%），-1表示对全库物品计算
+       
+        # ========== 4. 设置训练相关参数 ==========
+        # 新增损失函数权重和融合权重参数
+        self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 1
+        # 熵计算参数：控制熵只对召回的最相似的top-n个物品计
         entropy_topn_ratio = config['entropy_topn'] if 'entropy_topn' in config else -1
         if entropy_topn_ratio == -1:
             self.entropy_topn = -1  # 对全库物品计算
         else:
-            # 将百分比转换为实际的物品数量
             self.entropy_topn = max(1, int(self.n_items * entropy_topn_ratio))
 
-        # ========== 4. 设置训练相关参数 ==========
-        # 损失权重
-        
-        # 新增损失函数权重和融合权重参数
-        self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 0.6
-
-        # ========== 5. 构建检索器和融合组件 ==========
+        # ========== 5. 构建融合组件 ==========
         self._build_retrieval_components(config)
 
         # ========== 6. 初始化检索知识库相关变量 ==========
@@ -104,38 +96,15 @@ class TTARArec(SequentialRecommender):
         self.tar_item_knowledge = None  # 目标物品ID知识库
         self.seq_emb_index = None
         self.tar_emb_index = None
-        
         # 训练状态控制
         self.use_retrieval = False  # 初始时不使用检索增强
 
     def _build_retrieval_components(self, config):
-        """构建检索器MLP层和交叉注意力融合组件"""
-        # 检索器编码器相关参数
-        self.retriever_layers = config['retriever_layers'] if 'retriever_layers' in config else 0
-        self.retriever_dropout = config['retriever_dropout'] if 'retriever_dropout' in config else 0
-                
-        # 激活函数和dropout
-        self.retriever_act_fn = activation_layer(self.hidden_act)
-        self.retriever_dropout_layer = nn.Dropout(self.retriever_dropout)
-
-        # 构建检索器MLP层
-        self.retriever_mlp = nn.ModuleList()
-        self.retriever_layer_norms = nn.ModuleList()
-        
-        for i in range(self.retriever_layers):
-            self.retriever_mlp.append(
-                nn.Linear(self.hidden_size, self.hidden_size)
-            )
-            self.retriever_layer_norms.append(
-                nn.LayerNorm(self.hidden_size)
-            )
-
         # 交叉注意力融合机制参数（独立于预训练模型参数）
         self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 1
         self.fusion_inner_size = config['fusion_inner_size'] if 'fusion_inner_size' in config else 256
         self.fusion_dropout_prob = config['fusion_dropout_prob'] if 'fusion_dropout_prob' in config else 0
         self.fusion_layer_norm_eps = config['fusion_layer_norm_eps'] if 'fusion_layer_norm_eps' in config else 1e-12
-        
         # 交叉注意力融合机制组件（使用PyTorch MultiheadAttention）
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=self.hidden_size,
@@ -145,22 +114,14 @@ class TTARArec(SequentialRecommender):
             kdim=self.hidden_size,
             vdim=self.hidden_size
         )
-        
         self.fusion_ffn = FeedForward(self.hidden_size, self.fusion_inner_size, self.fusion_dropout_prob, self.hidden_act, self.fusion_layer_norm_eps)
-        
         # 位置嵌入（用于检索序列）
         self.fusion_position_embedding = nn.Embedding(self.topk, self.hidden_size)
-        
         # 构建完成后立即初始化权重
         self._init_component_weights()
 
     def _init_component_weights(self):
         """初始化检索器和融合组件的权重"""
-        # 初始化检索器MLP和LayerNorm
-        self.retriever_mlp.apply(self._init_weights)
-        for layer_norm in self.retriever_layer_norms:
-            self._init_weights(layer_norm)
-        
         # 初始化交叉注意力融合机制
         # PyTorch MultiheadAttention 已内置初始化
         self.fusion_ffn.apply(self._init_weights)
@@ -182,28 +143,11 @@ class TTARArec(SequentialRecommender):
         """获取物品嵌入 - 直接调用预训练模型"""
         with torch.no_grad():
             return self.pretrained_model.item_embedding(item_ids)
+
     def forward(self, item_seq, item_seq_len):
         """序列编码 - 直接调用预训练模型"""
         with torch.no_grad():
             return self.pretrained_model.forward(item_seq, item_seq_len)
-
-    def retriever_forward(self, seq_output):
-        """检索器编码器前向传播 - 使用MLP对序列表示进行非线性变换"""
-        hidden = seq_output  # [B, H]
-        
-        # 应用MLP层
-        for idx, (layer, layer_norm) in enumerate(zip(self.retriever_mlp, self.retriever_layer_norms)):
-            residual = hidden  # 残差连接
-            
-            # MLP变换
-            hidden = layer(hidden)
-            hidden = self.retriever_act_fn(hidden)
-            hidden = self.retriever_dropout_layer(hidden)
-            
-            # Layer Norm + 残差连接
-            hidden = layer_norm(hidden + residual)
-        
-        return hidden
     
     def fusion_forward(self, seq_output, key_sequences, value_sequences=None):
         """交叉注意力融合机制前向传播（使用nn.MultiheadAttention）"""
@@ -311,16 +255,7 @@ class TTARArec(SequentialRecommender):
         return attn_weights
 
     def compute_kl_loss(self, attention_probs, retrieval_probs):
-        """计算注意力分布与检索分布之间的KL散度损失 - 使用PyTorch库函数"""
-        # 确保两个分布的维度完全匹配
-        assert attention_probs.shape == retrieval_probs.shape, \
-            f"形状不匹配: attention_probs {attention_probs.shape} vs retrieval_probs {retrieval_probs.shape}"
-        
-        # 使用PyTorch的kl_div函数，更数值稳定
-        # kl_div接受log概率作为第一个参数，目标分布作为第二个参数
-        # KL(attention_probs || retrieval_probs)
         kl_div = F.kl_div(torch.log(attention_probs + 1e-8), retrieval_probs, reduction='batchmean')
-        
         return kl_div
 
     def calculate_loss(self, interaction):
@@ -350,21 +285,11 @@ class TTARArec(SequentialRecommender):
             enhanced_sequences=enhanced_sequences
         )
             
-        # 计算推荐损失（支持CE/BPR）
         if self.loss_type == 'CE':
-            # CE损失：使用全库logits
             test_item_emb = self.pretrained_model.item_embedding.weight
             logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))  # [B, N]
             rec_loss = self.loss_fct(logits, pos_items)  # 使用TTARArec自己的loss_fct
-        else:
-            # BPR损失：需要负采样
-            pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
-            # 简单负采样
-            neg_items = torch.randint(1, self.n_items, (pos_items.size(0),), device=pos_items.device)
-            neg_items_emb = self.get_item_embedding(neg_items)  # [B, H]
-            pos_score = torch.sum(seq_output_aug * pos_items_emb, dim=-1)  # [B]
-            neg_score = torch.sum(seq_output_aug * neg_items_emb, dim=-1)  # [B]
-            rec_loss = self.loss_fct(pos_score, neg_score)
+
 
         # 计算检索评分：使用预计算的增强序列表征
 
