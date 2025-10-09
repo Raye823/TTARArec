@@ -65,7 +65,6 @@ class TTARArec(SequentialRecommender):
         # ========== 6. 初始化检索知识库相关变量 ==========
         self.dataset = dataset
         self.user_id_list = None
-        self.item_seq_all = None
         self.item_seq_len_all = None
         self.seq_emb_knowledge = None
         self.item_seq_knowledge = None  # 原始交互序列知识库
@@ -233,15 +232,15 @@ class TTARArec(SequentialRecommender):
 
         target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
         enhanced_sequences=target_embs
-        seq_output_aug = self.seq_augmented(
+        
+        # 预测融合：直接返回融合后的logits
+        fused_logits = self.prediction_fusion(
             seq_output, batch_user_id, batch_seq_len, 
             enhanced_sequences=enhanced_sequences
         )
             
         if self.loss_type == 'CE':
-            test_item_emb = self.pretrained_model.item_embedding.weight
-            logits = torch.matmul(seq_output_aug, test_item_emb.transpose(0, 1))  # [B, N]
-            rec_loss = self.loss_fct(logits, pos_items)  
+            rec_loss = self.loss_fct(fused_logits, pos_items)  
 
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
@@ -257,13 +256,12 @@ class TTARArec(SequentialRecommender):
         total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         return total_loss
 
-    # ============ 知识库构建相关方法 ============
+    # ============ 协作知识库构建相关方法 ============
     
-    def precached_knowledge(self):
-        """预缓存知识库 - 构建检索索引"""
-        print("开始构建检索知识库...")
+    def build_collaborative_knowledge(self):
+        """构建协作知识库 - 构建检索索引"""
+        print("开始构建协作知识库...")
         seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, tar_item_knowledge, user_id_list = None, None, None, None, None
-        item_seq_all = None
         item_seq_len_all = None
         
         for batch_idx, interaction in enumerate(self.dataset):
@@ -285,11 +283,6 @@ class TTARArec(SequentialRecommender):
                 look_up_indices = interaction[self.ITEM_SEQ_LEN] > -1
             
             item_seq = interaction[self.ITEM_SEQ][look_up_indices]
-            if item_seq_all is None:
-                item_seq_all = item_seq
-            else:
-                item_seq_all = torch.cat((item_seq_all, item_seq), dim=0)
-                
             item_seq_len = interaction[self.ITEM_SEQ_LEN][look_up_indices]
             item_seq_len_list = list(item_seq_len.detach().cpu().numpy())
             if isinstance(item_seq_len_all, list):
@@ -334,7 +327,6 @@ class TTARArec(SequentialRecommender):
         
         # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
-        self.item_seq_all = item_seq_all
         self.item_seq_len_all = item_seq_len_all
         self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
         self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列
@@ -346,16 +338,16 @@ class TTARArec(SequentialRecommender):
         
         # 标记知识库已构建
         self.knowledge_built = True
-        print(f"知识库构建完成，包含 {len(user_id_list)} 个序列样本")
+        print(f"协作知识库构建完成，包含 {len(user_id_list)} 个序列样本")
         print(f"知识库四项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}，目标物品ID维度 {self.tar_item_knowledge.shape}")
 
-    def precached_knowledge_val(self, val_dataset):
-        """为验证集构建知识库 - 复用训练集知识库，只处理验证集新数据"""
-        print("为验证集构建检索知识库...")
+    def build_collaborative_knowledge_val(self, val_dataset):
+        """为验证集构建协作知识库 - 复用训练集知识库，只处理验证集新数据"""
+        print("为验证集构建协作知识库...")
         
         # 检查训练集知识库是否已构建
         if not hasattr(self, 'seq_emb_knowledge') or self.seq_emb_knowledge is None:
-            raise ValueError("训练集知识库未构建，请先调用 precached_knowledge()")
+            raise ValueError("训练集协作知识库未构建，请先调用 build_collaborative_knowledge()")
         
         # 复用训练集知识库
         print("复用训练集知识库...")
@@ -375,43 +367,19 @@ class TTARArec(SequentialRecommender):
             item_seq = interaction[self.ITEM_SEQ]
             item_seq_len = interaction[self.ITEM_SEQ_LEN]
             item_seq_len_list = list(item_seq_len.detach().cpu().numpy())
-            if isinstance(item_seq_len_all, list):
-                item_seq_len_all.extend(item_seq_len_list)
-            else:
-                item_seq_len_all = item_seq_len_list
+            item_seq_len_all.extend(item_seq_len_list)
 
             seq_output = self.forward(item_seq, item_seq_len)
             tar_items = interaction[self.POS_ITEM_ID]
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID].detach().cpu().numpy())
             
-            # 累积知识 - 三项内容
-            if isinstance(seq_emb_knowledge, np.ndarray):
-                seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
-            else:
-                seq_emb_knowledge = seq_output.detach().cpu().numpy()
-                
-            # 新增：累积原始交互序列
-            if isinstance(item_seq_knowledge, np.ndarray):
-                item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
-            else:
-                item_seq_knowledge = item_seq.detach().cpu().numpy()
-                
-            if isinstance(tar_emb_knowledge, np.ndarray):
-                tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
-            else:
-                tar_emb_knowledge = tar_items_emb.detach().cpu().numpy()
-            
-            # 累积目标物品ID
-            if isinstance(tar_item_knowledge, np.ndarray):
-                tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
-            else:
-                tar_item_knowledge = tar_items.detach().cpu().numpy()
-                
-            if isinstance(user_id_list, list):
-                user_id_list.extend(user_id_cans)
-            else:
-                user_id_list = user_id_cans
+            # 累积知识（直接拼接，因为已从训练集复用）
+            seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
+            item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
+            tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
+            tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
+            user_id_list.extend(user_id_cans)
                 
         # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
@@ -422,7 +390,7 @@ class TTARArec(SequentialRecommender):
         self.tar_item_knowledge = tar_item_knowledge  # 目标物品ID
         self._build_faiss_index()
         self.knowledge_built = True
-        print(f"验证集知识库构建完成，包含 {len(user_id_list)} 个序列样本")
+        print(f"验证集协作知识库构建完成，包含 {len(user_id_list)} 个序列样本")
 
     def _build_faiss_index(self):
         """构建Faiss检索索引"""
@@ -452,8 +420,8 @@ class TTARArec(SequentialRecommender):
         """启用检索增强功能"""
         self.use_retrieval = True
 
-    def seq_augmented(self, seq_output, batch_user_id, batch_seq_len, mode="train", enhanced_sequences=None):
-        """序列增强 - 使用训练后的交叉注意力层进行索引融合"""
+    def prediction_fusion(self, seq_output, batch_user_id, batch_seq_len, mode="train", enhanced_sequences=None):
+        """预测融合 - 先计算两个logits再融合（等价于序列融合，但语义更清晰）"""
         if enhanced_sequences is not None:
             retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
         else:
@@ -467,10 +435,10 @@ class TTARArec(SequentialRecommender):
         logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]       
         logits2 = torch.matmul(retrieval_enhanced_output, all_items_emb.transpose(0, 1))  # [B, N]
         alpha = self.compute_alpha_weights(logits1, logits2)  # [B]
-        alpha_expanded = alpha.unsqueeze(-1)  # [B, 1] -> [B, H]
-        augmented_output = seq_output * alpha_expanded + retrieval_enhanced_output * (1 - alpha_expanded)
+        alpha_expanded = alpha.unsqueeze(-1)  # [B, 1] -> [B, N]
+        fused_logits = logits1 * alpha_expanded + logits2 * (1 - alpha_expanded)  # [B, N]
         
-        return augmented_output
+        return fused_logits
 
     def predict(self, interaction):
         """预测单个物品的得分"""
@@ -491,10 +459,12 @@ class TTARArec(SequentialRecommender):
         if self.use_retrieval:
             batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
             batch_seq_len = item_seq_len.detach().cpu().numpy()
-            seq_output = self.seq_augmented(
+            # 预测融合：直接返回融合后的logits
+            scores = self.prediction_fusion(
                 seq_output, batch_user_id, batch_seq_len, mode="test"
             )
-        test_items_emb = self.pretrained_model.item_embedding.weight
-        scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+        else:
+            test_items_emb = self.pretrained_model.item_embedding.weight
+            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
         
         return scores

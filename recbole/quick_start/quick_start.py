@@ -78,13 +78,6 @@ def run_recbole(model=None, dataset=None, config_file_list=None, config_dict=Non
     freq = np.zeros(embedding_matrix.shape[0])
     for i in cnt:
         freq[i-1] = cnt[i]
-    
-    # freq /= freq.max()
-
-    # model evaluation
-    if config['model'] == 'RaSeRec':
-        model.precached_knowledge_val(valid_data)
-    test_result = trainer.evaluate(test_data, load_best_model=saved, show_progress=config['show_progress'])
 
     logger.info(set_color('best valid ', 'yellow') + f': {best_valid_result}')
     logger.info(set_color('test result', 'yellow') + f': {test_result}')
