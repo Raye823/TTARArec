@@ -14,48 +14,43 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
     config['log_dir'] = log_dir
     
     logger.info("="*50)
-    logger.info("TTARArec 检索增强推荐模型")
+    logger.info("TTARArec Retrieval-Augmented Recommendation Model")
     logger.info("="*50)
     logger.info(config)
-    # 数据集过滤
     dataset = create_dataset(config)
     logger.info(dataset)
-    # 数据集分割
     train_data, valid_data, test_data = data_preparation(config, dataset)
-    # 模型加载和初始化
-    logger.info("正在初始化TTARArec模型...")
+
+    logger.info("Initializing TTARArec model...")
     model = get_model(config['model'])(config, train_data).to(config['device'])
-    logger.info(f"预训练模型类型: {config['pretrained_model_type']}")
-    logger.info(f"预训练模型路径: {config['pretrained_model_path']}")
+    logger.info(f"Pretrained model type: {config['pretrained_model_type']}")
+    logger.info(f"Pretrained model path: {config['pretrained_model_path']}")
     logger.info(model)
-    # 初始化TTARArec的协作知识库
-    logger.info("正在构建TTARArec协作知识库...")
+    logger.info("Building TTARArec collaborative knowledge base...")
     model.build_collaborative_knowledge()
-    logger.info("协作知识库构建完成!")
-    # 加载trainer
+    logger.info("Collaborative knowledge base built successfully!")
+
     trainer = get_trainer(config['MODEL_TYPE'], config['model'])(config, model)
 
     valid_score, valid_result = trainer._valid_epoch(valid_data, show_progress=config['show_progress'])
-    logger.info(set_color('详细验证结果', 'blue') + f': {valid_result}')
+    logger.info(set_color('Detailed validation result', 'blue') + f': {valid_result}')
     test_result = trainer.evaluate(test_data, load_best_model=False, show_progress=config['show_progress'])
-    logger.info(set_color('初始测试结果', 'blue') + f': {test_result}')
-    # 启用检索增强功能（在初始评估后，训练前）
-    logger.info("启用检索增强功能")
+    logger.info(set_color('Initial test result', 'blue') + f': {test_result}')
+    logger.info("Enabling retrieval augmentation")
     model.enable_retrieval()
     logger.info("="*30)
-    logger.info("开始训练TTARArec")
+    logger.info("Start training TTARArec")
     logger.info("="*30)
     best_valid_score, best_valid_result = trainer.fit(
         train_data, valid_data, saved=saved, show_progress=config['show_progress']
     )
-    # 训练结束后，使用最佳模型进行测试集评估
     logger.info("="*30)
-    logger.info("最佳模型评估")
+    logger.info("Best model evaluation")
     logger.info("="*30)
     model.build_collaborative_knowledge_val(valid_data)
     test_result = trainer.evaluate(test_data, load_best_model=saved, show_progress=config['show_progress'])
-    logger.info(set_color('最佳验证结果', 'green') + f': {best_valid_result}')
-    logger.info(set_color('最终测试结果', 'green') + f': {test_result}')
+    logger.info(set_color('Best validation result', 'green') + f': {best_valid_result}')
+    logger.info(set_color('Final test result', 'green') + f': {test_result}')
     
     return {
         'best_valid_score': best_valid_score,
@@ -66,9 +61,9 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', '-d', type=str, required=True, help='数据集')
-    parser.add_argument('--pretrained_model_path', '-pp', type=str, required=True, help='预训练模型路径')
-    parser.add_argument('--pretrained_model_type', '-pt', type=str, required=True, help='预训练模型类型')
+    parser.add_argument('--dataset', '-d', type=str, required=True, help='Dataset name')
+    parser.add_argument('--pretrained_model_path', '-pp', type=str, required=True, help='Pretrained model path')
+    parser.add_argument('--pretrained_model_type', '-pt', type=str, required=True, help='Pretrained model type')
     args = parser.parse_args()
     
     config_dict = {

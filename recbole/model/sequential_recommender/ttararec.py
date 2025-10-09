@@ -4,7 +4,7 @@
 # @Email   : zhaoxinping@stu.hit.edu.cn
 
 """
-TTARArec (Text-Time Adaptive Retrieval Augmented Recommender)
+TTARArec (Test-Time Adaptive Retrieval Augmented Recommender)
 """
 
 import torch
@@ -26,57 +26,51 @@ class TTARArec(SequentialRecommender):
     def __init__(self, config, dataset):
         super(TTARArec, self).__init__(config, dataset)
 
-        # ========== 1. 保存用户指定的loss_type（在加载预训练模型之前） ==========
         user_specified_loss_type = config['loss_type'] if 'loss_type' in config else 'CE'
         self.loss_type = user_specified_loss_type
         self.loss_fct = nn.CrossEntropyLoss()
-        # ========== 2. 加载预训练模型 ==========
+        
+        # Load pretrained model and freeze parameters
         self.pretrained_model = PretrainedModelLoader.load_model(config, dataset)
         self.pretrained_model.requires_grad_(False)
-        # ========== 3. 从预训练模型获取基础架构参数 ==========
+        
         self.hidden_size = self.pretrained_model.hidden_size
         self.hidden_act = getattr(self.pretrained_model, 'hidden_act', config['hidden_act'] if 'hidden_act' in config else 'gelu')
         self.initializer_range = config['initializer_range']
         self.training_neg_sample_num = config['training_neg_sample_num'] if 'training_neg_sample_num' in config else self.bpr_num_negatives
-        # ========== 3. 设置检索相关参数 ==========
-        # 检索配置参数
+        
+        # Retrieval parameters
         self.topk = config['top_k'] if 'top_k' in config else 10
         self.nprobe = config['nprobe'] if 'nprobe' in config else 1
-        
-        # 序列长度过滤参数
         self.len_lower_bound = config["len_lower_bound"] if "len_lower_bound" in config else -1
         self.len_upper_bound = config["len_upper_bound"] if "len_upper_bound" in config else -1
         self.len_bound_reverse = config["len_bound_reverse"] if "len_bound_reverse" in config else True
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
        
-        # ========== 4. 设置训练相关参数 ==========
-        # 新增损失函数权重和融合权重参数
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 1
-        # 熵计算参数：控制熵只对召回的最相似的top-n个物品计
+        
+        # Entropy computation: -1 means compute over all items
         entropy_topn_ratio = config['entropy_topn'] if 'entropy_topn' in config else -1
         if entropy_topn_ratio == -1:
-            self.entropy_topn = -1  # 对全库物品计算
+            self.entropy_topn = -1
         else:
             self.entropy_topn = max(1, int(self.n_items * entropy_topn_ratio))
 
-        # ========== 5. 构建融合组件 ==========
         self._build_retrieval_components(config)
 
-        # ========== 6. 初始化检索知识库相关变量 ==========
+        # Initialize knowledge base variables
         self.dataset = dataset
         self.user_id_list = None
         self.item_seq_len_all = None
         self.seq_emb_knowledge = None
-        self.item_seq_knowledge = None  # 原始交互序列知识库
+        self.item_seq_knowledge = None
         self.tar_emb_knowledge = None
-        self.tar_item_knowledge = None  # 目标物品ID知识库
+        self.tar_item_knowledge = None
         self.seq_emb_index = None
         self.tar_emb_index = None
-        # 训练状态控制
-        self.use_retrieval = False  # 初始时不使用检索增强
+        self.use_retrieval = False
 
     def _build_retrieval_components(self, config):
-        # 交叉注意力融合机制参数（独立于预训练模型参数）
         self.fusion_n_heads = config['fusion_n_heads'] if 'fusion_n_heads' in config else 1
         self.fusion_inner_size = config['fusion_inner_size'] if 'fusion_inner_size' in config else 256
         self.fusion_dropout_prob = config['fusion_dropout_prob'] if 'fusion_dropout_prob' in config else 0
@@ -94,14 +88,12 @@ class TTARArec(SequentialRecommender):
         self._init_component_weights()
 
     def _init_component_weights(self):
-        """初始化检索器和融合组件的权重"""
-        # 初始化交叉注意力融合机制
-        # PyTorch MultiheadAttention 已内置初始化
+        """Initialize fusion component weights"""
         self.fusion_ffn.apply(self._init_weights)
         self.fusion_position_embedding.apply(self._init_weights)
 
     def _init_weights(self, module):
-        """权重初始化回调函数"""
+        """Weight initialization callback"""
         if isinstance(module, nn.Linear):
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
             if module.bias is not None:
@@ -113,35 +105,31 @@ class TTARArec(SequentialRecommender):
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
             
     def get_item_embedding(self, item_ids):
-        """获取物品嵌入 - 直接调用预训练模型"""
         with torch.no_grad():
             return self.pretrained_model.item_embedding(item_ids)
 
     def forward(self, item_seq, item_seq_len):
-        """序列编码 - 直接调用预训练模型"""
         with torch.no_grad():
             return self.pretrained_model.forward(item_seq, item_seq_len)
     
     def fusion_forward(self, seq_output, key_sequences, value_sequences=None):
-        """交叉注意力融合机制前向传播（使用nn.MultiheadAttention）"""
+        """Cross-attention fusion mechanism"""
         if value_sequences is None:
             value_sequences = key_sequences
-        # 形状：[B, 1, H] 与 [B, K, H]
         query = seq_output.unsqueeze(1)
         key = key_sequences
         value = value_sequences
-        # nn.MultiheadAttention expects (B, L, H) with batch_first=True
         fused_output, attn_weights = self.cross_attn(query, key, value, need_weights=True)
-        fused_output = fused_output.squeeze(1)  # [B, H]
+        fused_output = fused_output.squeeze(1)
         fused_output = self.fusion_ffn(fused_output)
         return fused_output
 
     def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
-        """检索相似序列和对应的目标物品ID以及原始交互序列（基于q检索）"""
+        """Retrieve similar sequences and corresponding target item IDs"""
         queries_cpu = queries.detach().cpu().numpy()
         normalize_L2(queries_cpu)
         _, I1 = self.seq_emb_index.search(queries_cpu, 8 * topk)
-        # 过滤掉同用户的相同长度序列
+        # Filter out same-user sequences 
         I1_filtered = []
         for i, I_entry in enumerate(I1):
             current_user = batch_user_id[i]
@@ -153,14 +141,14 @@ class TTARArec(SequentialRecommender):
             ]
             I1_filtered.append(filtered_indices[:topk])
         I1_filtered = np.array(I1_filtered)
-        # 获取检索结果 - 三项内容：序列表征、原始交互序列、目标物品ID
-        retrieval_seqs = self.seq_emb_knowledge[I1_filtered]  # 序列表征
-        retrieval_item_seqs = self.item_seq_knowledge[I1_filtered]  # 原始交互序列
-        retrieval_tar_items = self.tar_item_knowledge[I1_filtered]  # 目标物品ID
+        
+        retrieval_seqs = self.seq_emb_knowledge[I1_filtered]
+        retrieval_item_seqs = self.item_seq_knowledge[I1_filtered]
+        retrieval_tar_items = self.tar_item_knowledge[I1_filtered]
         return (
             torch.tensor(retrieval_seqs).to("cuda"), 
-            torch.tensor(retrieval_item_seqs).to("cuda"),  # 原始交互序列
-            torch.tensor(retrieval_tar_items).to("cuda"),  # 目标物品ID
+            torch.tensor(retrieval_item_seqs).to("cuda"),
+            torch.tensor(retrieval_tar_items).to("cuda"),
         )
 
     def compute_entropy(self, logits):
@@ -174,40 +162,39 @@ class TTARArec(SequentialRecommender):
         return entropy
     
     def compute_alpha_weights(self, logits1, logits2):
-        """基于两个logits的熵计算融合权重α"""
-        h1 = self.compute_entropy(logits1)  # [B] 或 [B,K]
-        h2 = self.compute_entropy(logits2)  # [B] 或 [B,K]
+        """Compute fusion weight α based on entropy of two logits"""
+        h1 = self.compute_entropy(logits1)
+        h2 = self.compute_entropy(logits2)
         exp_h1 = torch.exp(1.0 / (1.0 + h1))
         exp_h2 = torch.exp(1.0 / (1.0 + h2))
         alpha = exp_h1 / (exp_h1 + exp_h2)
         return alpha   
-    # ============ 损失计算相关方法 ============
     
     def compute_retrieval_scores(self, retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len, enhanced_sequences=None):
         batch_size = pos_items.size(0)
         n_retrieved = enhanced_sequences.size(1) 
-        pos_items_emb = self.get_item_embedding(pos_items)  # [B, H]
-        all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
+        pos_items_emb = self.get_item_embedding(pos_items)
+        all_items_emb = self.pretrained_model.item_embedding.weight
 
         if enhanced_sequences is not None:
             if self.loss_type == 'CE':
-                logits_k = torch.matmul(enhanced_sequences, all_items_emb.transpose(0, 1))  # [B, K, N]
+                logits_k = torch.matmul(enhanced_sequences, all_items_emb.transpose(0, 1))
                 ce_losses_k = F.cross_entropy(
-                    logits_k.reshape(-1, logits_k.size(-1)),  # [B*K, N]
-                    pos_items.unsqueeze(1).expand(-1, n_retrieved).reshape(-1),  # [B*K]
+                    logits_k.reshape(-1, logits_k.size(-1)),
+                    pos_items.unsqueeze(1).expand(-1, n_retrieved).reshape(-1),
                     reduction='none'
-                ).reshape(batch_size, n_retrieved)  # [B, K]
+                ).reshape(batch_size, n_retrieved)
                 logits = -ce_losses_k  
         return torch.softmax(logits / 0.01, dim=1).detach()
 
     def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
-        """计算注意力评分 - 使用nn.MultiheadAttention提取注意力权重"""
+        """Compute attention scores using cross-attention weights"""
         if enhanced_sequences is not None:
             key_sequences = enhanced_sequences
             value_sequences = enhanced_sequences
-        query = seq_output.unsqueeze(1)  # [B, 1, H]
+        query = seq_output.unsqueeze(1)
         _, attn_weights = self.cross_attn(query, key_sequences, value_sequences, need_weights=True, average_attn_weights=False)
-        attn_weights = attn_weights.squeeze(2).mean(dim=1)  # [B, K]
+        attn_weights = attn_weights.squeeze(2).mean(dim=1)
         return attn_weights
 
     def compute_kl_loss(self, attention_probs, retrieval_probs):
@@ -215,7 +202,7 @@ class TTARArec(SequentialRecommender):
         return kl_div
 
     def calculate_loss(self, interaction):
-        """计算训练损失 - KL散度损失 + 推荐损失"""
+        """Calculate training loss: KL divergence loss + recommendation loss"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
@@ -230,10 +217,9 @@ class TTARArec(SequentialRecommender):
             topk=self.topk
         )
 
-        target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
+        target_embs = self.get_item_embedding(retrieved_tar_items)
         enhanced_sequences=target_embs
         
-        # 预测融合：直接返回融合后的logits
         fused_logits = self.prediction_fusion(
             seq_output, batch_user_id, batch_seq_len, 
             enhanced_sequences=enhanced_sequences
@@ -245,7 +231,7 @@ class TTARArec(SequentialRecommender):
         retrieval_probs = self.compute_retrieval_scores(
             retrieved_item_seqs, retrieved_tar_items, pos_items, item_seq, item_seq_len, batch_seq_len,
             enhanced_sequences=enhanced_sequences
-        )  # [B, K]
+        )
         
         attention_probs = self.compute_attention_scores(
             seq_output, None, None, enhanced_sequences=enhanced_sequences
@@ -255,19 +241,15 @@ class TTARArec(SequentialRecommender):
 
         total_loss = kl_loss * self.kl_loss_weight + rec_loss 
         return total_loss
-
-    # ============ 协作知识库构建相关方法 ============
     
     def build_collaborative_knowledge(self):
-        """构建协作知识库 - 构建检索索引"""
-        print("开始构建协作知识库...")
+        print("Building collaborative knowledge base...")
         seq_emb_knowledge, item_seq_knowledge, tar_emb_knowledge, tar_item_knowledge, user_id_list = None, None, None, None, None
         item_seq_len_all = None
         
         for batch_idx, interaction in enumerate(self.dataset):
             interaction = interaction.to("cuda")
             
-            # 根据序列长度过滤
             if self.len_lower_bound != -1 or self.len_upper_bound != -1:
                 if self.len_lower_bound != -1 and self.len_upper_bound != -1:
                     look_up_indices = (interaction[self.ITEM_SEQ_LEN] >= self.len_lower_bound) * \
@@ -290,67 +272,48 @@ class TTARArec(SequentialRecommender):
             else:
                 item_seq_len_all = item_seq_len_list
                 
-            # 获取序列表示
             seq_output = self.forward(item_seq, item_seq_len)
             tar_items = interaction[self.POS_ITEM_ID][look_up_indices]
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID][look_up_indices].detach().cpu().numpy())
-            
-            # 累积知识 - 四项内容：序列表征、原始交互序列、目标嵌入、目标物品ID
             if isinstance(seq_emb_knowledge, np.ndarray):
                 seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             else:
                 seq_emb_knowledge = seq_output.detach().cpu().numpy()
-            
-            # 累积原始交互序列
             if isinstance(item_seq_knowledge, np.ndarray):
                 item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
             else:
                 item_seq_knowledge = item_seq.detach().cpu().numpy()
-            
-            # 累积目标嵌入
             if isinstance(tar_emb_knowledge, np.ndarray):
                 tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
             else:
                 tar_emb_knowledge = tar_items_emb.detach().cpu().numpy()
-            
-            # 累积目标物品ID
             if isinstance(tar_item_knowledge, np.ndarray):
                 tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
             else:
                 tar_item_knowledge = tar_items.detach().cpu().numpy()
-            
             if isinstance(user_id_list, list):
                 user_id_list.extend(user_id_cans)
             else:
                 user_id_list = user_id_cans
-        
-        # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
         self.item_seq_len_all = item_seq_len_all
-        self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
-        self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列
-        self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
-        self.tar_item_knowledge = tar_item_knowledge  # 目标物品ID
+        self.seq_emb_knowledge = seq_emb_knowledge
+        self.item_seq_knowledge = item_seq_knowledge
+        self.tar_emb_knowledge = tar_emb_knowledge
+        self.tar_item_knowledge = tar_item_knowledge
         
-        # 构建Faiss索引
         self._build_faiss_index()
-        
-        # 标记知识库已构建
         self.knowledge_built = True
-        print(f"协作知识库构建完成，包含 {len(user_id_list)} 个序列样本")
-        print(f"知识库四项内容：序列表征维度 {self.seq_emb_knowledge.shape}，原始序列维度 {self.item_seq_knowledge.shape}，目标嵌入维度 {self.tar_emb_knowledge.shape}，目标物品ID维度 {self.tar_item_knowledge.shape}")
+        print(f"Collaborative knowledge base built: {len(user_id_list)} samples")
 
     def build_collaborative_knowledge_val(self, val_dataset):
-        """为验证集构建协作知识库 - 复用训练集知识库，只处理验证集新数据"""
-        print("为验证集构建协作知识库...")
+        print("Building validation collaborative knowledge base...")
         
-        # 检查训练集知识库是否已构建
         if not hasattr(self, 'seq_emb_knowledge') or self.seq_emb_knowledge is None:
-            raise ValueError("训练集协作知识库未构建，请先调用 build_collaborative_knowledge()")
+            raise ValueError("Training knowledge base not built, please call build_collaborative_knowledge() first")
         
-        # 复用训练集知识库
-        print("复用训练集知识库...")
+        print("Reusing training knowledge base...")
         seq_emb_knowledge = self.seq_emb_knowledge.copy()
         item_seq_knowledge = self.item_seq_knowledge.copy()
         tar_emb_knowledge = self.tar_emb_knowledge.copy()
@@ -358,9 +321,7 @@ class TTARArec(SequentialRecommender):
         user_id_list = self.user_id_list.copy()
         item_seq_len_all = self.item_seq_len_all.copy()
         
-        print(f"训练集知识库大小: {len(user_id_list)} 个样本")
         
-        # 处理验证集
         for batch_idx, batched_data in enumerate(val_dataset):
             interaction, history_index, swap_row, swap_col_after, swap_col_before = batched_data
             interaction = interaction.to("cuda")
@@ -374,30 +335,27 @@ class TTARArec(SequentialRecommender):
             tar_items_emb = self.get_item_embedding(tar_items)
             user_id_cans = list(interaction[self.USER_ID].detach().cpu().numpy())
             
-            # 累积知识（直接拼接，因为已从训练集复用）
             seq_emb_knowledge = np.concatenate((seq_emb_knowledge, seq_output.detach().cpu().numpy()), 0)
             item_seq_knowledge = np.concatenate((item_seq_knowledge, item_seq.detach().cpu().numpy()), 0)
             tar_emb_knowledge = np.concatenate((tar_emb_knowledge, tar_items_emb.detach().cpu().numpy()), 0)
             tar_item_knowledge = np.concatenate((tar_item_knowledge, tar_items.detach().cpu().numpy()), 0)
             user_id_list.extend(user_id_cans)
                 
-        # 保存知识库 - 四项内容
         self.user_id_list = user_id_list
         self.item_seq_len_all = item_seq_len_all
-        self.seq_emb_knowledge = seq_emb_knowledge  # 序列表征
-        self.item_seq_knowledge = item_seq_knowledge  # 原始交互序列  
-        self.tar_emb_knowledge = tar_emb_knowledge  # 目标嵌入
-        self.tar_item_knowledge = tar_item_knowledge  # 目标物品ID
+        self.seq_emb_knowledge = seq_emb_knowledge
+        self.item_seq_knowledge = item_seq_knowledge
+        self.tar_emb_knowledge = tar_emb_knowledge
+        self.tar_item_knowledge = tar_item_knowledge
         self._build_faiss_index()
         self.knowledge_built = True
-        print(f"验证集协作知识库构建完成，包含 {len(user_id_list)} 个序列样本")
+        print(f"Validation knowledge base built: {len(user_id_list)} samples")
 
     def _build_faiss_index(self):
-        """构建Faiss检索索引"""
+        """Build Faiss retrieval index"""
         d = self.hidden_size
         nlist = 128
         
-        # 构建序列嵌入索引
         seq_emb_knowledge_copy = np.array(self.seq_emb_knowledge, copy=True)
         normalize_L2(seq_emb_knowledge_copy)
         seq_emb_quantizer = faiss.IndexFlatL2(d) 
@@ -406,7 +364,6 @@ class TTARArec(SequentialRecommender):
         self.seq_emb_index.add(seq_emb_knowledge_copy)    
         self.seq_emb_index.nprobe = self.nprobe
 
-        # 构建目标嵌入索引
         tar_emb_knowledge_copy = np.array(self.tar_emb_knowledge, copy=True)
         normalize_L2(tar_emb_knowledge_copy)
         tar_emb_quantizer = faiss.IndexFlatL2(d) 
@@ -415,43 +372,40 @@ class TTARArec(SequentialRecommender):
         self.tar_emb_index.add(tar_emb_knowledge_copy) 
         self.tar_emb_index.nprobe = self.nprobe
 
-    # ============ 预测相关方法 ============
     def enable_retrieval(self):
-        """启用检索增强功能"""
+        """Enable retrieval augmentation"""
         self.use_retrieval = True
 
     def prediction_fusion(self, seq_output, batch_user_id, batch_seq_len, mode="train", enhanced_sequences=None):
-        """预测融合 - 先计算两个logits再融合（等价于序列融合，但语义更清晰）"""
+        """Prediction fusion: compute and fuse two logits"""
         if enhanced_sequences is not None:
             retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
         else:
             retrieved_seqs, retrieved_item_seqs, retrieved_tar_items = self.retrieve_seq_tar(
                 seq_output, batch_user_id, batch_seq_len, topk=self.topk, mode=mode
             )
-            target_embs = self.get_item_embedding(retrieved_tar_items)  # [B, K, H]
+            target_embs = self.get_item_embedding(retrieved_tar_items)
             retrieval_enhanced_output = self.fusion_forward(seq_output, target_embs)
         
-        all_items_emb = self.pretrained_model.item_embedding.weight  # [N, H]
-        logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))  # [B, N]       
-        logits2 = torch.matmul(retrieval_enhanced_output, all_items_emb.transpose(0, 1))  # [B, N]
-        alpha = self.compute_alpha_weights(logits1, logits2)  # [B]
-        alpha_expanded = alpha.unsqueeze(-1)  # [B, 1] -> [B, N]
-        fused_logits = logits1 * alpha_expanded + logits2 * (1 - alpha_expanded)  # [B, N]
+        all_items_emb = self.pretrained_model.item_embedding.weight
+        logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))
+        logits2 = torch.matmul(retrieval_enhanced_output, all_items_emb.transpose(0, 1))
+        alpha = self.compute_alpha_weights(logits1, logits2)
+        alpha_expanded = alpha.unsqueeze(-1)
+        fused_logits = logits1 * alpha_expanded + logits2 * (1 - alpha_expanded)
         
         return fused_logits
 
     def predict(self, interaction):
-        """预测单个物品的得分"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         test_item = interaction[self.ITEM_ID]
         seq_output = self.forward(item_seq, item_seq_len)
         test_item_emb = self.get_item_embedding(test_item)
-        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)  # [B]
+        scores = torch.mul(seq_output, test_item_emb).sum(dim=1)
         return scores
 
     def full_sort_predict(self, interaction):
-        """全排序预测 - 根据训练状态决定是否使用检索增强"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
@@ -459,12 +413,11 @@ class TTARArec(SequentialRecommender):
         if self.use_retrieval:
             batch_user_id = interaction[self.USER_ID].detach().cpu().numpy()
             batch_seq_len = item_seq_len.detach().cpu().numpy()
-            # 预测融合：直接返回融合后的logits
             scores = self.prediction_fusion(
                 seq_output, batch_user_id, batch_seq_len, mode="test"
             )
         else:
             test_items_emb = self.pretrained_model.item_embedding.weight
-            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))  # [B, n_items]
+            scores = torch.matmul(seq_output, test_items_emb.transpose(0, 1))
         
         return scores
