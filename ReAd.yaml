@@ -49,7 +49,7 @@ topk: [5, 10, 20, 50]
 # ======================================
 # TTARArec Retrieval Augmentation Parameters
 # ======================================
-nprobe: 1                       # Number of Faiss search probes
+nprobe: 2                       # Number of Faiss search probes
 top_k: 10                         # Retrieve top-k similar sequences
 low_popular: 100                 # Low popularity threshold, use augmentation for sequences shorter than this
 len_lower_bound: -1              # Sequence length lower bound, -1 means no limit

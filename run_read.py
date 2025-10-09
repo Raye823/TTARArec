@@ -83,7 +83,7 @@ if __name__ == '__main__':
         eval_ttararec(
             model_name='TTARArec',
             dataset=args.dataset,  # Can be None, will be loaded from checkpoint
-            config_file_list=['ttararec_config.yaml'],
+            config_file_list=['ReAd.yaml'],
             config_dict=config_dict if config_dict else None,
             model_path=args.model_path
         )
@@ -104,6 +104,6 @@ if __name__ == '__main__':
         run_ttararec(
             model='TTARArec', 
             dataset=args.dataset, 
-            config_file_list=['ttararec_config.yaml'], 
+            config_file_list=['ReAd.yaml'], 
             config_dict=config_dict
         )
