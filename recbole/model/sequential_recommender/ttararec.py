@@ -48,7 +48,8 @@ class TTARArec(SequentialRecommender):
         self.low_popular = config['low_popular'] if 'low_popular' in config else 100
        
         self.kl_loss_weight = config['kl_loss_weight'] if 'kl_loss_weight' in config else 1
-        
+        self.fusion_weight = None
+
         # Entropy computation: -1 means compute over all items
         entropy_topn_ratio = config['entropy_topn'] if 'entropy_topn' in config else -1
         if entropy_topn_ratio == -1:
@@ -382,8 +383,14 @@ class TTARArec(SequentialRecommender):
         all_items_emb = self.pretrained_model.item_embedding.weight
         logits1 = torch.matmul(seq_output, all_items_emb.transpose(0, 1))
         logits2 = torch.matmul(retrieval_enhanced_output, all_items_emb.transpose(0, 1))
-        alpha = self.compute_alpha_weights(logits1, logits2)
-        alpha_expanded = alpha.unsqueeze(-1)
+        # Use fusion weight if set, otherwise use dynamic alpha
+        if self.fusion_weight is not None:
+            alpha = self.fusion_weight
+            alpha_expanded = torch.tensor(alpha).to(logits1.device)
+        else:
+            alpha = self.compute_alpha_weights(logits1, logits2)
+            alpha_expanded = alpha.unsqueeze(-1)
+        
         fused_logits = logits1 * alpha_expanded + logits2 * (1 - alpha_expanded)
         
         return fused_logits

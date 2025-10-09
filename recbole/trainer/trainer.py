@@ -104,7 +104,8 @@ class Trainer(AbstractTrainer):
         self.evaluator = ProxyEvaluator(config)
         self.item_tensor = None
         self.tot_item_num = None
-
+        self._apply_fusion_weight_override(config, model)
+    
     def _build_optimizer(self, params):
         r"""Init the Optimizer
 
@@ -469,6 +470,14 @@ class Trainer(AbstractTrainer):
         if save_path:
             plt.savefig(save_path)
 
+        
+    def _apply_fusion_weight_override(self, config, model):
+        if not hasattr(model, 'fusion_weight'):
+            return
+        dataset_name = config['dataset'].lower()
+        pretrained_model_type = config['pretrained_model_type'].lower()
+        if dataset_name == 'ml-1m' and pretrained_model_type == 'duorec':
+            model.fusion_weight = 0.9
 
 class KGTrainer(Trainer):
     r"""KGTrainer is designed for Knowledge-aware recommendation methods. Some of these models need to train the
