@@ -1,14 +1,5 @@
 model: TTARArec
 # ======================================
-# Pretrained Model Configuration
-# ======================================
-pretrained_model_type: duorec  # 支持: duorec, sasrec
-pretrained_model_path: "./log/DuoRec/Amazon_Beauty/bs1024-lmd0.1-sem0.1-us_x-Sep-24-2025_20-27-58-lr0.001-l20-tau1-dot-DPh0.5-DPa0.5/model.pth"
-MAX_ITEM_LIST_LENGTH: 50
-hidden_act: 'gelu'
-layer_norm_eps: 1e-12
-initializer_range: 0.02
-# ======================================
 # Directory Settings
 # ======================================
 log_root: "./log/"
@@ -43,6 +34,10 @@ stopping_step: 10
 weight_decay: 0
 loss_type: 'CE'
 training_neg_sample_num: 0
+MAX_ITEM_LIST_LENGTH: 50
+hidden_act: 'gelu'
+layer_norm_eps: 1e-12
+initializer_range: 0.02
 # ======================================
 # Evaluation Settings
 # ======================================

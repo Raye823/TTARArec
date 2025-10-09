@@ -1,6 +1,4 @@
 import argparse
-import torch
-import logging
 from logging import getLogger
 from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
@@ -98,15 +96,15 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', '-d', type=str, default='Amazon_Beauty', help='数据集')
-    parser.add_argument('--pretrained_model_path', type=str, required=False, help='预训练模型路径')
-    
+    parser.add_argument('--dataset', '-d', type=str, required=True, help='数据集')
+    parser.add_argument('--pretrained_model_path', '-pp', type=str, required=True, help='预训练模型路径')
+    parser.add_argument('--pretrained_model_type', '-pt', type=str, required=True, help='预训练模型类型')
     args = parser.parse_args()
     
-    # 简单配置：仅在命令行提供时覆盖，否则留给配置文件读取
-    config_dict = {}
-    if args.pretrained_model_path is not None:
-        config_dict['pretrained_model_path'] = args.pretrained_model_path
+    config_dict = {
+        'pretrained_model_path': args.pretrained_model_path,
+        'pretrained_model_type': args.pretrained_model_type
+    }
     
     run_ttararec(
         model='TTARArec', 
