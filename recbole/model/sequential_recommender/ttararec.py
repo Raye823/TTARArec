@@ -88,7 +88,6 @@ class TTARArec(SequentialRecommender):
         self._init_component_weights()
 
     def _init_component_weights(self):
-        """Initialize fusion component weights"""
         self.fusion_ffn.apply(self._init_weights)
         self.fusion_position_embedding.apply(self._init_weights)
 
@@ -125,7 +124,6 @@ class TTARArec(SequentialRecommender):
         return fused_output
 
     def retrieve_seq_tar(self, queries, batch_user_id, batch_seq_len, topk=5, mode="train"):
-        """Retrieve similar sequences and corresponding target item IDs"""
         queries_cpu = queries.detach().cpu().numpy()
         normalize_L2(queries_cpu)
         _, I1 = self.seq_emb_index.search(queries_cpu, 8 * topk)
@@ -162,7 +160,6 @@ class TTARArec(SequentialRecommender):
         return entropy
     
     def compute_alpha_weights(self, logits1, logits2):
-        """Compute fusion weight α based on entropy of two logits"""
         h1 = self.compute_entropy(logits1)
         h2 = self.compute_entropy(logits2)
         exp_h1 = torch.exp(1.0 / (1.0 + h1))
@@ -188,7 +185,6 @@ class TTARArec(SequentialRecommender):
         return torch.softmax(logits / 0.01, dim=1).detach()
 
     def compute_attention_scores(self, seq_output, key_sequences, value_sequences=None, enhanced_sequences=None):
-        """Compute attention scores using cross-attention weights"""
         if enhanced_sequences is not None:
             key_sequences = enhanced_sequences
             value_sequences = enhanced_sequences
@@ -202,7 +198,6 @@ class TTARArec(SequentialRecommender):
         return kl_div
 
     def calculate_loss(self, interaction):
-        """Calculate training loss: KL divergence loss + recommendation loss"""
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         seq_output = self.forward(item_seq, item_seq_len)
@@ -352,7 +347,6 @@ class TTARArec(SequentialRecommender):
         print(f"Validation knowledge base built: {len(user_id_list)} samples")
 
     def _build_faiss_index(self):
-        """Build Faiss retrieval index"""
         d = self.hidden_size
         nlist = 128
         
@@ -373,11 +367,9 @@ class TTARArec(SequentialRecommender):
         self.tar_emb_index.nprobe = self.nprobe
 
     def enable_retrieval(self):
-        """Enable retrieval augmentation"""
         self.use_retrieval = True
 
     def prediction_fusion(self, seq_output, batch_user_id, batch_seq_len, mode="train", enhanced_sequences=None):
-        """Prediction fusion: compute and fuse two logits"""
         if enhanced_sequences is not None:
             retrieval_enhanced_output = self.fusion_forward(seq_output, enhanced_sequences)
         else:

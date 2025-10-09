@@ -2,7 +2,7 @@ import argparse
 from logging import getLogger
 from recbole.config import Config
 from recbole.data import create_dataset, data_preparation
-from recbole.utils import init_logger, get_model, get_trainer, init_seed
+from recbole.utils import init_logger, get_model, get_trainer, init_seed, eval_ttararec
 from recbole.utils.utils import set_color
 
 def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=None, saved=True):
@@ -61,19 +61,49 @@ def run_ttararec(model=None, dataset=None, config_file_list=None, config_dict=No
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', '-d', type=str, required=True, help='Dataset name')
-    parser.add_argument('--pretrained_model_path', '-pp', type=str, required=True, help='Pretrained model path')
-    parser.add_argument('--pretrained_model_type', '-pt', type=str, required=True, help='Pretrained model type')
+    parser.add_argument('--dataset', '-d', type=str, default=None, help='Dataset name (optional in eval mode, required in training mode)')
+    parser.add_argument('--pretrained_model_path', '-pp', type=str, default=None, help='Pretrained model path (optional in eval mode, required in training mode)')
+    parser.add_argument('--pretrained_model_type', '-pt', type=str, default=None, help='Pretrained model type (optional in eval mode, required in training mode)')
+    parser.add_argument('--eval', '-e', action='store_true', help='Evaluation mode: load trained model and evaluate')
+    parser.add_argument('--model_path', '-mp', type=str, default=None, help='Trained TTARArec model path (required in eval mode)')
     args = parser.parse_args()
     
-    config_dict = {
-        'pretrained_model_path': args.pretrained_model_path,
-        'pretrained_model_type': args.pretrained_model_type
-    }
-    
-    run_ttararec(
-        model='TTARArec', 
-        dataset=args.dataset, 
-        config_file_list=['ttararec_config.yaml'], 
-        config_dict=config_dict
-    )
+    if args.eval:
+        # Evaluation mode
+        if args.model_path is None:
+            raise ValueError("--model_path is required in evaluation mode. Please specify the trained model path.")
+        
+        # Build config_dict only with provided arguments (non-None values)
+        config_dict = {}
+        if args.pretrained_model_path is not None:
+            config_dict['pretrained_model_path'] = args.pretrained_model_path
+        if args.pretrained_model_type is not None:
+            config_dict['pretrained_model_type'] = args.pretrained_model_type
+        
+        eval_ttararec(
+            model_name='TTARArec',
+            dataset=args.dataset,  # Can be None, will be loaded from checkpoint
+            config_file_list=['ttararec_config.yaml'],
+            config_dict=config_dict if config_dict else None,
+            model_path=args.model_path
+        )
+    else:
+        # Training mode - require all parameters
+        if args.dataset is None:
+            raise ValueError("--dataset is required in training mode.")
+        if args.pretrained_model_path is None:
+            raise ValueError("--pretrained_model_path is required in training mode.")
+        if args.pretrained_model_type is None:
+            raise ValueError("--pretrained_model_type is required in training mode.")
+        
+        config_dict = {
+            'pretrained_model_path': args.pretrained_model_path,
+            'pretrained_model_type': args.pretrained_model_type
+        }
+        
+        run_ttararec(
+            model='TTARArec', 
+            dataset=args.dataset, 
+            config_file_list=['ttararec_config.yaml'], 
+            config_dict=config_dict
+        )
